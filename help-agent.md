@@ -75,8 +75,27 @@ to workers from the same session. This prevents cross-session task leakage.
 The worker blocks until it receives a task, then prints it to stdout and
 exits. The sub-agent reads the task, executes it, and returns the result.
 
-Spawn a mix of workers based on expected workload — e.g., 1 opus + 2 sonnet
-for a typical session. Adjust as needed.
+#### Pool sizing
+
+**Baseline** (always spawn): 1 sonnet. This covers the most common
+dispatches — file reads, searches, builds, tests.
+
+Scale up based on the session's workload:
+
+| Session type | Add to baseline | Why |
+|---|---|---|
+| **Exploration / research** (audit, codebase review) | +1 opus, +1 sonnet | Deep reasoning + parallel searches |
+| **Implementation** (coding against a plan) | +1 opus, +1-2 sonnet | Complex changes + tests/builds/mechanical edits |
+| **Bulk / parallel** (same pattern across many files) | +2-3 sonnet or haiku | Fan out repetitive work |
+| **Light** (conversation-heavy, occasional lookups) | baseline only | Don't waste idle workers |
+
+Rules of thumb:
+- Never spawn more workers than you expect to use in the next ~5 minutes —
+  they time out at 590s and the context cost is wasted.
+- Respawn immediately after a worker completes — don't let the pool go empty.
+- Don't idle more than 1 opus at a time — opus context is expensive.
+- haiku is only worth it for truly mechanical work (grep-and-report,
+  build-and-report). Hand off to sonnet for anything requiring judgement.
 
 The 590s timeout stays within Claude Code's 600s bash tool limit. Workers
 reconnect to the broker internally every 60 seconds, so a single call

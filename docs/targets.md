@@ -22,7 +22,7 @@ Workers register with `--session <id>` and the broker only routes
 dispatches to workers from the same session. This prevents cross-session
 task leakage when multiple Claude Code sessions share a single broker.
 
-Status: code complete — needs release as v0.7.0.
+Status: achieved — released as v0.7.0.
 
 ### 🎯T2.1 main.go compiles with session-scoped workers
 
