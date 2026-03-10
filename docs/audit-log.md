@@ -25,3 +25,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `802cc2f`
 - **Outcome**: Released v0.4.0 (darwin-arm64, linux-amd64, linux-arm64). Added delegation guidance and model selection to operational guide.
+
+## 2026-03-11 — /release v0.5.0
+
+- **Commit**: `2c9d5da`
+- **Outcome**: Released v0.5.0 (darwin-arm64, linux-amd64, linux-arm64). Added session-scoped status query (`cworkers status --session <id>`). Reframed delegation guide to default to delegating everything.
