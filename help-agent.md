@@ -35,20 +35,13 @@ a command, ask yourself: can a worker do this instead? Usually yes.
 - **sonnet** — Well-scoped coding tasks, mechanical changes across files,
   writing tests, running builds, triaging errors, anything with clear
   structure and bounded scope.
-- **haiku** — File searches, find-and-replace, running builds/tests and
-  reporting results, simple data gathering. Hand off to sonnet for
-  diagnosis and fix decisions.
 
 When in doubt, use sonnet. Reserve opus for tasks that genuinely need
-deeper reasoning. Use haiku for monotonous grunt work.
+deeper reasoning.
 
 ## Session Setup
 
-Run these steps at the start of each session.
-
-### 1. Register your session transcript for shadow mode
-
-Find your session's JSONL transcript file and register it:
+At the start of each session, register your transcript for shadow mode:
 
 ```bash
 cworkers shadow --session <session-id> --transcript <path-to-transcript.jsonl>
@@ -59,60 +52,21 @@ UUID). Shadow mode tails the transcript and maintains a rolling window of
 recent messages. When you dispatch tasks, workers automatically receive this
 context.
 
-### 2. Spawn workers
-
-Use the Agent tool to spawn workers. Each worker is a sub-agent whose bash
-call blocks on `cworkers worker`:
-
-```bash
-cworkers worker --session <session-id> --model opus --timeout 590s
-```
-
-Workers are session-scoped: `--session` is required and must match the
-session ID used for shadow and dispatch. The broker only routes dispatches
-to workers from the same session. This prevents cross-session task leakage.
-
-The worker blocks until it receives a task, then prints it to stdout and
-exits. The sub-agent reads the task, executes it, and returns the result.
-
-#### Pool sizing
-
-**Baseline** (always spawn): 1 sonnet. This covers the most common
-dispatches — file reads, searches, builds, tests.
-
-Scale up based on the session's workload:
-
-| Session type | Add to baseline | Why |
-|---|---|---|
-| **Exploration / research** (audit, codebase review) | +1 opus, +1 sonnet | Deep reasoning + parallel searches |
-| **Implementation** (coding against a plan) | +1 opus, +1-2 sonnet | Complex changes + tests/builds/mechanical edits |
-| **Bulk / parallel** (same pattern across many files) | +2-3 sonnet or haiku | Fan out repetitive work |
-| **Light** (conversation-heavy, occasional lookups) | baseline only | Don't waste idle workers |
-
-Rules of thumb:
-- Never spawn more workers than you expect to use in the next ~5 minutes —
-  they time out at 590s and the context cost is wasted.
-- Respawn immediately after a worker completes — don't let the pool go empty.
-- Don't idle more than 1 opus at a time — opus context is expensive.
-- haiku is only worth it for truly mechanical work (grep-and-report,
-  build-and-report). Hand off to sonnet for anything requiring judgement.
-
-The 590s timeout stays within Claude Code's 600s bash tool limit. Workers
-reconnect to the broker internally every 60 seconds, so a single call
-covers the full window.
-
-### 3. Respawn workers
-
-After a worker completes a task or times out, spawn a replacement. Keep
-the pool stocked so dispatches are served instantly.
+**Do not spawn workers upfront.** The pool starts empty and warms itself
+on demand — see "Self-warming pool" below.
 
 ## Dispatching Tasks
 
-Send a task to a matching worker:
+When you need to delegate work:
 
-```bash
-cworkers dispatch --session <session-id> --model opus "Analyze the error handling in src/api/"
-```
+1. **Check for an idle worker**: `cworkers status --session <session-id>`
+2. **If a worker is available**: dispatch directly:
+   ```bash
+   cworkers dispatch --session <session-id> --model sonnet "Analyze the error handling in src/api/"
+   ```
+3. **If no worker is available**: spawn a regular Agent instead (it pays
+   the startup cost anyway). The agent will prime the pool before doing
+   its work — see below.
 
 - `--session` injects your conversation context into the task
 - `--model` routes to a worker with the matching tag
@@ -121,6 +75,41 @@ cworkers dispatch --session <session-id> --model opus "Analyze the error handlin
 The response is `OK` (task delivered) or `NO_WORKERS` (exit code 2). If no
 worker is immediately available, the broker waits up to 30 seconds for one
 to register.
+
+## Self-Warming Pool
+
+The pool maintains itself through a single invariant: **every new instance
+(agent or worker) spawns a replacement worker before doing its own work.**
+
+The sequence:
+
+1. **First dispatch** — no idle worker exists, so the root session spawns a
+   regular Agent.
+2. **Agent starts** — its first action is to spawn a background worker via
+   the Agent tool:
+   ```bash
+   cworkers worker --session <session-id> --model sonnet --timeout 60s
+   ```
+   Then it proceeds with its actual task.
+3. **Next dispatch** — the idle worker from step 2 receives it instantly
+   (no startup cost). The worker's agent spawns another background worker
+   before executing the task.
+4. **Repeat** — each completed task seeds the next idle worker.
+5. **Idle timeout** — if no dispatch arrives within 60s, the worker expires
+   and the pool drains to zero. No tokens wasted.
+
+This is self-perpetuating: busy sessions always have a warm worker ready;
+idle sessions cost nothing.
+
+### Rules
+
+- Use `--timeout 60s` for replacement workers (one idle cycle, then die).
+- Match the replacement worker's `--model` to the current agent's model —
+  if you're an opus agent, spawn an opus worker.
+- The root session only spawns a regular Agent when no idle worker exists.
+  Once the chain starts, workers sustain themselves.
+- For burst parallelism (multiple concurrent tasks), spawn multiple agents
+  directly — each one will seed a replacement worker.
 
 ## Checking Status
 
@@ -136,7 +125,7 @@ For session-scoped status (is my shadow registered? are workers available?):
 cworkers status --session <session-id>
 ```
 
-Output: `SESSION: my-sess, shadow: true, available_workers: 3 (opus: 1, sonnet: 2)`
+Output: `SESSION: my-sess, shadow: true, available_workers: 1 (sonnet: 1)`
 
 ## Cleanup
 
