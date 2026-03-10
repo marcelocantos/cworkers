@@ -45,3 +45,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `93f22eb`
 - **Outcome**: Released v0.8.0 (darwin-arm64, linux-amd64, linux-arm64). Added worker pool sizing guidance. Moved operational guide from inline CLAUDE.md to separate file reference pattern. Homebrew formula updated.
+
+## 2026-03-11 — /release v0.9.0
+
+- **Commit**: `505506d`
+- **Outcome**: Released v0.9.0 (darwin-arm64, linux-amd64, linux-arm64). Self-warming worker pool: workers spawn replacements before doing work, replacing upfront pool spawning. Removed haiku from model selection. Added burst/team exclusion rules. Homebrew formula updated.

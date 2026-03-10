@@ -57,6 +57,10 @@ on demand — see "Self-warming pool" below.
 
 ## Dispatching Tasks
 
+**Always prefer cworkers over the Agent tool when an idle worker is
+available.** Workers have zero startup overhead and automatic context
+injection — the Agent tool should only be used as a fallback.
+
 When you need to delegate work:
 
 1. **Check for an idle worker**: `cworkers status --session <session-id>`
@@ -106,10 +110,18 @@ idle sessions cost nothing.
 - Use `--timeout 60s` for replacement workers (one idle cycle, then die).
 - Match the replacement worker's `--model` to the current agent's model —
   if you're an opus agent, spawn an opus worker.
+- **One new per one used** — each consumed worker spawns exactly one
+  replacement. Don't spawn extras speculatively.
 - The root session only spawns a regular Agent when no idle worker exists.
   Once the chain starts, workers sustain themselves.
-- For burst parallelism (multiple concurrent tasks), spawn multiple agents
-  directly — each one will seed a replacement worker.
+- **Burst parallelism** (skills like `/cv` that fan out many agents at
+  once): use regular Agent spawning, not cworkers. The slight startup
+  latency is outweighed by the volume of work being performed. The
+  self-warming pool is designed for steady-state individual dispatches,
+  not sudden bursts.
+- **Team agents** do not participate in the self-warming pool. Teams
+  manage their own lifecycle — don't spawn replacement workers from
+  team agents.
 
 ## Checking Status
 

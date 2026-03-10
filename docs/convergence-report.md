@@ -2,15 +2,20 @@
 
 Standing invariants: all green. No CI configured; tests pass locally.
 
+## Movement
+
+- 🎯T1: (unchanged — achieved)
+- 🎯T2: (unchanged — achieved)
+
 ## Gap Report
 
 ### 🎯T1 cworkers is published as open-source on GitHub
 Gap: achieved
-All sub-targets met. Repo live, v0.1.0+ released, audit logged.
+All sub-targets met. Repo live, multiple releases published, audit logged.
 
 ### 🎯T2 Workers are session-scoped
 Gap: achieved
-All sub-targets met. Released as v0.7.0 with Homebrew formula updated.
+All sub-targets met. Released as v0.7.0.
 
   - [x] 🎯T2.1 main.go compiles — achieved
   - [x] 🎯T2.2 All tests pass — achieved
@@ -18,35 +23,29 @@ All sub-targets met. Released as v0.7.0 with Homebrew formula updated.
 
 ## Recommendation
 
-All active targets are achieved. The project has no open convergence gaps.
+All active targets are achieved. However, unreleased work exists on master:
 
-Consider:
-- Adding new targets for future work (e.g., automatic transcript discovery, task acknowledgment, 1.0 readiness)
-- Running `/audit` for a periodic health check
+- **Self-warming pool** (commit `505506d`) — replaces upfront pool spawning with demand-driven self-warming. Committed but not yet tagged/released as v0.9.0.
+
+Create 🎯T3 for the v0.9.0 release, then use `/release` to publish it.
 
 ## Suggested action
 
-No action needed — all targets converged. Create new targets when ready for the next round of work.
+Create a new target 🎯T3 "v0.9.0 released with self-warming pool" in `docs/targets.md`, then run `/release` to tag and publish.
 
 <!-- convergence-deps
-evaluated: 2026-03-11T00:00:00Z
-sha: 5b72f3a
+evaluated: 2026-03-11T12:00:00Z
+sha: 505506d
 
 🎯T1:
   gap: achieved
   assessment: "All sub-targets achieved. Open-sourced and released."
   read:
     - docs/targets.md
-    - docs/audit-log.md
 
 🎯T2:
   gap: achieved
   assessment: "Session-scoped workers released as v0.7.0."
   read:
-    - main.go
-    - main_test.go
     - docs/targets.md
-    - help-agent.md
-    - DESIGN.md
-    - STABILITY.md
 -->
