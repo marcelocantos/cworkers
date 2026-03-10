@@ -1,12 +1,13 @@
 BINARY := cworkers
 INSTALL_DIR := /usr/local/bin
+VERSION ?= dev
 
 .PHONY: build test clean install
 
 build: $(BINARY)
 
 $(BINARY): main.go go.mod
-	go build -o $(BINARY) .
+	go build -ldflags "-X main.version=$(VERSION)" -o $(BINARY) .
 
 test:
 	go test ./...

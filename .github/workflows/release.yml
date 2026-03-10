@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          go build -ldflags "-X main.version=$GITHUB_REF_NAME" -o cworkers .
+          tar czf "cworkers-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" cworkers
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release upload "$GITHUB_REF_NAME" "cworkers-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz"
+
+  homebrew:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Justintime50/homebrew-releaser@v3
+        with:
+          homebrew_owner: marcelocantos
+          homebrew_tap: homebrew-tap
+          github_token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          formula_folder: Formula
+          install: 'bin.install "cworkers" => "cworkers"'
+          target_darwin_arm64: true
+          target_linux_amd64: true
+          target_linux_arm64: true
+          test: 'system bin/"cworkers", "--version"'
+          skip_checksum: true
+          update_readme_table: true

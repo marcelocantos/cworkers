@@ -1,86 +1,109 @@
 # cworkers Agent Guide
 
-This guide explains how an AI coding agent should use cworkers to delegate
-tasks to pre-spawned worker agents.
+cworkers is a task broker that lets you delegate work to pre-spawned worker
+agents over a Unix domain socket. Workers are idle and waiting — dispatched
+tasks arrive instantly with no startup overhead. Shadow mode gives workers
+automatic awareness of your conversation context.
 
-## Typical Workflow
+## Installation
 
-1. **Start the broker** at the beginning of your session:
+```bash
+brew install marcelocantos/tap/cworkers
+```
 
-   ```bash
-   cworkers serve &
-   ```
+## Setup
 
-2. **Register your session's transcript** for shadow mode:
+Run these steps at the start of your session.
 
-   ```bash
-   cworkers shadow --session my-session --transcript /path/to/session.jsonl
-   ```
+### 1. Start the broker
 
-   This tells the broker to tail the transcript and inject recent conversation
-   context into tasks dispatched for this session.
+```bash
+pgrep -f "cworkers serve" || cworkers serve &
+```
 
-3. **Spawn workers** as background bash calls:
+The broker is global (one per user). It listens on
+`/tmp/cworkers-<uid>.sock`.
 
-   ```bash
-   cworkers worker --model opus --timeout 590s &
-   cworkers worker --model sonnet --timeout 590s &
-   ```
+### 2. Register your session transcript for shadow mode
 
-   Workers block until they receive a task or their timeout expires.
-   The 590s timeout stays within the 600s bash tool limit.
+Find your session's JSONL transcript file and register it:
 
-4. **Dispatch tasks** when you need to delegate:
+```bash
+cworkers shadow --session <session-id> --transcript <path-to-transcript.jsonl>
+```
 
-   ```bash
-   cworkers dispatch --session my-session --model opus "Analyze the error handling in src/api/"
-   ```
+Use a unique session identifier (e.g., your working directory basename or a
+UUID). Shadow mode tails the transcript and maintains a rolling window of
+recent messages. When you dispatch tasks, workers automatically receive this
+context.
 
-   The `--session` flag tells the broker which session's shadow context to
-   inject. The response is either `OK` (task delivered) or `NO_WORKERS`
-   (exit code 2).
+### 3. Spawn workers
 
-5. **Check pool status** at any time:
+Spawn workers as background processes. Use `--model` to tag them for routing:
 
-   ```bash
-   cworkers status
-   ```
+```bash
+cworkers worker --model opus --timeout 590s &
+cworkers worker --model sonnet --timeout 590s &
+```
 
-   Output: `WORKERS: 3 (opus: 1, sonnet: 2), shadows: 2`
+The 590s timeout stays within Claude Code's 600s bash tool limit. Workers
+reconnect internally every 60 seconds, so a single call covers the full
+window. Respawn workers after they complete a task or their timeout expires.
 
-6. **Remove shadow** when your session ends:
+## Dispatching Tasks
 
-   ```bash
-   cworkers unshadow --session my-session
-   ```
+Send a task to a matching worker:
 
-## Multi-Session Support
+```bash
+cworkers dispatch --session <session-id> --model opus "Analyze the error handling in src/api/"
+```
 
-The broker is global (one per user). Multiple Claude Code sessions share
-a single broker, each registering its own transcript via `shadow`. Dispatches
-include a `--session` flag to select which session's context to inject.
+- `--session` injects your conversation context into the task
+- `--model` routes to a worker with the matching tag
+- Omit `--model` for any-available-worker dispatch
+
+The response is `OK` (task delivered) or `NO_WORKERS` (exit code 2, no
+matching worker within the wait period).
+
+If no worker is immediately available, the broker waits up to 30 seconds
+for one to register. This handles the gap when a replacement worker is
+still spawning.
 
 ## Model Routing
 
-Use `--model` to route tasks by complexity:
+Use model tags to route tasks by complexity:
+
 - **opus** — deep reasoning, architectural analysis, novel problem-solving
-- **sonnet** — well-scoped coding tasks, mechanical changes, test writing
-- Omit `--model` for any-model dispatch
+- **sonnet** — well-scoped coding, mechanical changes, test writing
+- Omit `--model` on either side for wildcard matching
 
-## Dispatch Queue
+## Checking Status
 
-If no matching worker is available, dispatch waits up to 30 seconds (configurable
-via `--wait` on the broker) for one to register. This handles the race condition
-where a replacement worker is still spawning.
+```bash
+cworkers status
+```
 
-## Worker Lifecycle
+Output: `WORKERS: 3 (opus: 1, sonnet: 2), shadows: 1`
 
-Workers reconnect to the broker every 60 seconds internally, so a single
-`cworkers worker` call covers the full timeout window. When a worker receives
-a task, it prints the task to stdout and exits. Respawn workers after they
-complete a task or their timeout expires.
+## Cleanup
 
-## Socket Path
+When your session ends, remove the shadow registration:
 
-Default: `/tmp/cworkers-<uid>.sock`. Use `--sock` to disambiguate when
-running multiple concurrent sessions.
+```bash
+cworkers unshadow --session <session-id>
+```
+
+## Reference
+
+Run `cworkers --help` for the full flag reference:
+
+| Command | Key Flags |
+|---|---|
+| `serve` | `--wait <dur>` (dispatch wait timeout, default 30s) |
+| `worker` | `--timeout <dur>` (lifetime, default 590s), `--model <name>` |
+| `dispatch` | `--model <name>`, `--session <id>` |
+| `shadow` | `--session <id>` (required), `--transcript <path>` (required), `--context <N>` (default 50) |
+| `unshadow` | `--session <id>` (required) |
+| `status` | (no flags) |
+
+Global: `--sock <path>` overrides the default socket path.
