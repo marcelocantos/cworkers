@@ -51,6 +51,7 @@ jobs:
           github_token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           formula_folder: Formula
           install: 'bin.install "cworkers" => "cworkers"'
+          version: ${{ github.event.release.tag_name }}
           target_darwin_arm64: true
           target_linux_amd64: true
           target_linux_arm64: true
