@@ -11,11 +11,24 @@ brew services start marcelocantos/tap/cworkers
 
 ## 2. Configure Claude Code
 
-Append the output of `cworkers --help-agent` to `~/.claude/CLAUDE.md` so
-that every future session has the operational instructions available
-automatically.
+1. Write the operational guide to a file:
+   ```bash
+   cworkers --help-agent > ~/.claude/cworkers-guide.md
+   ```
+
+2. Add a reference to `~/.claude/CLAUDE.md`:
+   ```markdown
+   ## cworkers — Task Delegation
+
+   **At session start**, read
+   [`~/.claude/cworkers-guide.md`](~/.claude/cworkers-guide.md) and follow
+   its guidelines throughout the session. It covers when to delegate, model
+   selection, session setup, worker pool sizing, dispatching, and cleanup.
+
+   This feature is experimental so keep an eye out for glitches.
+   ```
 
 ## 3. Start using it
 
-Follow the operational guide you just added to set up task delegation for
-this session.
+Read `~/.claude/cworkers-guide.md` and follow the session setup instructions
+to begin delegating work.

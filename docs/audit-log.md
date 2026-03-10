@@ -40,3 +40,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `c059ae9`
 - **Outcome**: Released v0.7.0 (darwin-arm64, linux-amd64, linux-arm64). Session-scoped workers: `--session` required for worker command, broker routes dispatches only to same-session workers. Breaking WORKER protocol change (pre-1.0). Homebrew formula updated.
+
+## 2026-03-11 — /release v0.8.0
+
+- **Commit**: `93f22eb`
+- **Outcome**: Released v0.8.0 (darwin-arm64, linux-amd64, linux-arm64). Added worker pool sizing guidance. Moved operational guide from inline CLAUDE.md to separate file reference pattern. Homebrew formula updated.
