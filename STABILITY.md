@@ -9,7 +9,7 @@ forking to a new product). The pre-1.0 period exists to get these right.
 
 ## Interaction Surface Catalogue
 
-Snapshot as of v0.1.0.
+Snapshot as of v0.2.0.
 
 ### CLI Subcommands
 

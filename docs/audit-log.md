@@ -10,3 +10,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 - **Deferred**:
   - go.sum missing (no external deps, but causes cache warnings in CI)
   - homebrew-releaser README table tags not configured in tap repo (non-critical warning)
+
+## 2026-03-10 — /release v0.2.0
+
+- **Commit**: `2a567c3`
+- **Outcome**: Released v0.2.0 (darwin-arm64, linux-amd64, linux-arm64). Split agent guide into installation and operational guides. Homebrew formula updated.
