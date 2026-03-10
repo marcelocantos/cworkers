@@ -109,7 +109,11 @@ func main() {
 	case "serve":
 		serve(sock, dispatchWait)
 	case "worker":
-		worker(sock, timeout, model)
+		if session == "" {
+			fmt.Fprintln(os.Stderr, "worker: --session is required")
+			os.Exit(1)
+		}
+		worker(sock, timeout, model, session)
 	case "dispatch":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "usage: cworkers dispatch <task>")
@@ -136,6 +140,7 @@ commands:
   serve      Start the broker
                --wait <dur>         Max time to wait for a worker on dispatch (default: 30s)
   worker     Block until a task arrives, print it
+               --session <id>       Session to bind to (required)
                --timeout <dur>      Total lifetime before exit (e.g. 590s)
                --model <name>       Register as a specific model (e.g. opus, sonnet)
   dispatch   Send a task to an available worker
@@ -365,8 +370,9 @@ func processLine(line []byte, s *shadow) {
 // --- Pool ---
 
 type taggedWorker struct {
-	conn  net.Conn
-	model string
+	conn    net.Conn
+	model   string
+	session string
 }
 
 type pool struct {
@@ -378,11 +384,12 @@ type pool struct {
 
 type dispatchWaiter struct {
 	model   string
+	session string
 	ch      chan net.Conn
 	expires time.Time
 }
 
-func (p *pool) add(conn net.Conn, model string) {
+func (p *pool) add(conn net.Conn, model, session string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -394,7 +401,7 @@ func (p *pool) add(conn net.Conn, model string) {
 		if now.After(w.expires) {
 			continue // drop expired
 		}
-		if matched < 0 && (w.model == "" || w.model == model) {
+		if matched < 0 && w.session == session && (w.model == "" || w.model == model) {
 			matched = n
 		}
 		p.waiters[n] = p.waiters[i]
@@ -409,16 +416,16 @@ func (p *pool) add(conn net.Conn, model string) {
 		return
 	}
 
-	p.workers = append(p.workers, taggedWorker{conn: conn, model: model})
+	p.workers = append(p.workers, taggedWorker{conn: conn, model: model, session: session})
 }
 
-// take returns the first worker matching the requested model.
-// If model is "", any worker matches.
-func (p *pool) take(model string) net.Conn {
+// take returns the first worker matching the requested model and session.
+// If model is "", any model matches. Session must always match exactly.
+func (p *pool) take(model, session string) net.Conn {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for i, w := range p.workers {
-		if model == "" || w.model == model {
+		if w.session == session && (model == "" || w.model == model) {
 			p.workers = append(p.workers[:i], p.workers[i+1:]...)
 			return w.conn
 		}
@@ -428,12 +435,13 @@ func (p *pool) take(model string) net.Conn {
 
 // wait registers a dispatch waiter and returns a channel that will
 // receive a worker connection when one becomes available.
-func (p *pool) wait(model string, deadline time.Time) chan net.Conn {
+func (p *pool) wait(model, session string, deadline time.Time) chan net.Conn {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	ch := make(chan net.Conn, 1)
 	p.waiters = append(p.waiters, dispatchWaiter{
 		model:   model,
+		session: session,
 		ch:      ch,
 		expires: deadline,
 	})
@@ -458,21 +466,34 @@ func (p *pool) count() int {
 	return len(p.workers)
 }
 
-// countForModel returns the number of workers matching the given model.
-// If model is "", counts all workers.
-func (p *pool) countForModel(model string) int {
+// countForSession returns the number of workers for a given session.
+func (p *pool) countForSession(session string) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if model == "" {
-		return len(p.workers)
-	}
 	n := 0
 	for _, w := range p.workers {
-		if w.model == model || w.model == "" {
+		if w.session == session {
 			n++
 		}
 	}
 	return n
+}
+
+// countsForSession returns per-model worker counts for a given session.
+func (p *pool) countsForSession(session string) map[string]int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	m := make(map[string]int)
+	for _, w := range p.workers {
+		if w.session == session {
+			model := w.model
+			if model == "" {
+				model = "any"
+			}
+			m[model]++
+		}
+	}
+	return m
 }
 
 func (p *pool) counts() map[string]int {
@@ -578,15 +599,30 @@ func handleConn(conn net.Conn, p *pool, reg *shadowRegistry, dispatchWait time.D
 
 	switch cmd {
 	case "WORKER":
-		model := ""
-		if len(parts) > 1 {
-			model = parts[1]
+		// Parse "WORKER <model> <session>" with positional fields.
+		// Both model and session can be empty. Use SplitN to preserve empty fields.
+		workerArgs := ""
+		if len(cmdParts) > 1 {
+			workerArgs = cmdParts[1]
 		}
-		p.add(conn, model)
+		wFields := strings.SplitN(workerArgs, " ", 2)
+		model := ""
+		session := ""
+		if len(wFields) > 0 {
+			model = wFields[0]
+		}
+		if len(wFields) > 1 {
+			session = wFields[1]
+		}
+		p.add(conn, model, session)
+		label := "any"
 		if model != "" {
-			fmt.Fprintf(os.Stderr, "broker: worker registered [%s] (pool: %d)\n", model, p.count())
+			label = model
+		}
+		if session != "" {
+			fmt.Fprintf(os.Stderr, "broker: worker registered [%s] session=%s (pool: %d)\n", label, session, p.count())
 		} else {
-			fmt.Fprintf(os.Stderr, "broker: worker registered (pool: %d)\n", p.count())
+			fmt.Fprintf(os.Stderr, "broker: worker registered [%s] (pool: %d)\n", label, p.count())
 		}
 
 	case "DISPATCH":
@@ -643,12 +679,12 @@ func handleConn(conn net.Conn, p *pool, reg *shadowRegistry, dispatchWait time.D
 		}
 
 		// Try to find a live worker immediately.
-		w := p.take(model)
+		w := p.take(model, session)
 		if w == nil {
 			// No worker available — wait for one to register.
 			fmt.Fprintf(os.Stderr, "broker: no %s worker available, waiting up to %s\n", target, dispatchWait)
 			deadline := time.Now().Add(dispatchWait)
-			ch := p.wait(model, deadline)
+			ch := p.wait(model, session, deadline)
 
 			timer := time.NewTimer(dispatchWait)
 			defer timer.Stop()
@@ -677,7 +713,7 @@ func handleConn(conn net.Conn, p *pool, reg *shadowRegistry, dispatchWait time.D
 				return
 			}
 			fmt.Fprintf(os.Stderr, "broker: stale worker removed\n")
-			w = p.take(model)
+			w = p.take(model, session)
 			if w == nil {
 				fmt.Fprintf(os.Stderr, "broker: dispatch failed — no %s workers\n", target)
 				fmt.Fprintf(conn, "NO_WORKERS\n")
@@ -731,9 +767,9 @@ func handleConn(conn net.Conn, p *pool, reg *shadowRegistry, dispatchWait time.D
 		if sessionID != "" {
 			// Session-scoped status.
 			shadowed := reg.has(sessionID)
-			matching := p.countForModel("") // all workers are potentially available
+			matching := p.countForSession(sessionID)
 			fmt.Fprintf(&sb, "SESSION: %s, shadow: %t, available_workers: %d", sessionID, shadowed, matching)
-			counts := p.counts()
+			counts := p.countsForSession(sessionID)
 			if len(counts) > 0 {
 				fmt.Fprintf(&sb, " (")
 				first := true
@@ -779,7 +815,7 @@ func handleConn(conn net.Conn, p *pool, reg *shadowRegistry, dispatchWait time.D
 // worker loops internally, reconnecting to the broker every 60 seconds.
 // The agent sees a single blocking bash call that either prints a task
 // or exits cleanly on overall timeout. No agent-level looping needed.
-func worker(sock string, timeout time.Duration, model string) {
+func worker(sock string, timeout time.Duration, model, session string) {
 	if timeout <= 0 {
 		timeout = 590 * time.Second
 	}
@@ -791,7 +827,7 @@ func worker(sock string, timeout time.Duration, model string) {
 		remaining := time.Until(deadline)
 		wait := min(reconnectInterval, remaining)
 
-		task := workerTryOnce(sock, model, wait)
+		task := workerTryOnce(sock, model, session, wait)
 		if task != nil {
 			fmt.Print(string(task))
 			return
@@ -803,7 +839,7 @@ func worker(sock string, timeout time.Duration, model string) {
 
 // workerTryOnce connects to the broker, registers, and waits up to
 // the given duration for a task. Returns nil if no task arrived.
-func workerTryOnce(sock, model string, wait time.Duration) []byte {
+func workerTryOnce(sock, model, session string, wait time.Duration) []byte {
 	conn, err := net.Dial("unix", sock)
 	if err != nil {
 		// Broker might be restarting — sleep briefly and let caller retry.
@@ -812,11 +848,7 @@ func workerTryOnce(sock, model string, wait time.Duration) []byte {
 	}
 	defer conn.Close()
 
-	if model != "" {
-		fmt.Fprintf(conn, "WORKER %s\n", model)
-	} else {
-		fmt.Fprintf(conn, "WORKER\n")
-	}
+	fmt.Fprintf(conn, "WORKER %s %s\n", model, session)
 
 	conn.SetReadDeadline(time.Now().Add(wait))
 

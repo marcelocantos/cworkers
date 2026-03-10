@@ -33,7 +33,7 @@ Snapshot as of v0.6.0.
 | `--wait <dur>` | serve | duration | 30s | Stable |
 | `--timeout <dur>` | worker | duration | 590s | Stable |
 | `--model <name>` | worker, dispatch | string | "" (wildcard) | Stable |
-| `--session <id>` | dispatch, shadow, unshadow, status | string | "" | Needs review |
+| `--session <id>` | worker, dispatch, shadow, unshadow, status | string | "" | Needs review |
 | `--transcript <path>` | shadow | string | — (required) | Needs review |
 | `--context <N>` | shadow | int | 50 | Needs review |
 
@@ -43,7 +43,7 @@ Line-based text over Unix domain socket.
 
 | Command | Format | Stability |
 |---|---|---|
-| `WORKER` | `WORKER [<model>]\n` | Stable |
+| `WORKER` | `WORKER <model> <session>\n` | Needs review — session scoping is new; positional encoding matches DISPATCH. |
 | `DISPATCH` | `DISPATCH <model> <session>\n<task body>` | Needs review — positional empty-field encoding is fragile. |
 | `SHADOW` | `SHADOW <session-id> <transcript-path> [context-lines]\n` | Needs review |
 | `UNSHADOW` | `UNSHADOW <session-id>\n` | Needs review |

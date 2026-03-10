@@ -52,11 +52,15 @@ All communication uses a line-based text protocol over a Unix domain socket
 ### Worker Registration
 
 ```
-Client: WORKER <model>\n
+Client: WORKER <model> <session>\n
 Server: (connection held open until task arrives or timeout)
 Server: <context>\n\nTASK: <task body>   (on dispatch)
 Server: (connection closed cleanly on timeout)
 ```
+
+Workers are session-scoped: the broker only routes dispatches to workers
+from the same session. Both `<model>` and `<session>` are positional and
+can be empty (empty = wildcard).
 
 ### Task Dispatch
 
