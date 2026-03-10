@@ -2,7 +2,7 @@
 
 A task broker for [Claude Code](https://claude.ai/code) agent sessions.
 Pre-spawns idle worker agents that receive tasks instantly over a Unix socket,
-with optional conversation context injection from the root session's transcript.
+with multi-session shadow mode for automatic conversation context injection.
 
 ## Why
 
@@ -27,20 +27,26 @@ make install  # copies to /usr/local/bin (may need sudo)
 ## Quick Start
 
 ```bash
-# 1. Start the broker (with optional transcript shadowing)
-cworkers serve --transcript ~/.claude/projects/.../session.jsonl &
+# 1. Start the broker (global, one per user)
+cworkers serve &
 
-# 2. Spawn workers
+# 2. Register your session's transcript for shadow mode
+cworkers shadow --session my-session --transcript ~/.claude/projects/.../session.jsonl
+
+# 3. Spawn workers
 cworkers worker --model opus --timeout 590s &
 cworkers worker --model sonnet --timeout 590s &
 
-# 3. Dispatch tasks
-cworkers dispatch --model opus "Analyze the error handling in src/api/"
+# 4. Dispatch tasks (with session context)
+cworkers dispatch --session my-session --model opus "Analyze the error handling in src/api/"
 # => OK
 
-# 4. Check status
+# 5. Check status
 cworkers status
-# => WORKERS: 1 (sonnet: 1), shadow: 4096 bytes
+# => WORKERS: 1 (sonnet: 1), shadows: 1
+
+# 6. Clean up when session ends
+cworkers unshadow --session my-session
 ```
 
 ## Commands
@@ -49,18 +55,23 @@ cworkers status
 |---------|-------------|
 | `serve` | Start the broker on a Unix socket |
 | `worker` | Register as an idle worker, block until a task arrives |
-| `dispatch` | Send a task to a matching worker |
-| `status` | Show pool size by model |
+| `dispatch` | Send a task to a matching worker (with optional session context) |
+| `shadow` | Register a session's transcript for context injection |
+| `unshadow` | Remove a session's shadow registration |
+| `status` | Show pool size by model and shadow count |
 
 Run `cworkers --help` for full flag reference, or `cworkers --help-agent` for
 the agent integration guide.
 
 ## Shadow Mode
 
-When started with `--transcript <path>`, the broker tails the root session's
-JSONL transcript and maintains a rolling window of recent messages. Dispatched
-tasks are automatically prefixed with this context, giving workers awareness of
-the conversation without the root agent summarising anything.
+Each session registers its transcript via `cworkers shadow`. The broker tails
+the JSONL file and maintains a rolling window of recent messages. When
+dispatching with `--session`, the broker prepends that session's context to the
+task, giving workers awareness of the conversation without the root agent
+summarising anything.
+
+Multiple sessions can share a single broker, each with its own shadow.
 
 ## Model Routing
 

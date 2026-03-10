@@ -410,7 +410,7 @@ func tempSock(t *testing.T) string {
 	return path
 }
 
-func startTestBroker(t *testing.T, transcript string, contextLines int) (string, func()) {
+func startTestBroker(t *testing.T) (string, *shadowRegistry, func()) {
 	t.Helper()
 	sock := tempSock(t)
 	ln, err := net.Listen("unix", sock)
@@ -419,14 +419,7 @@ func startTestBroker(t *testing.T, transcript string, contextLines int) (string,
 	}
 
 	p := &pool{}
-	var s *shadow
-	if transcript != "" {
-		s = newShadow(contextLines)
-		go tailTranscript(transcript, s)
-		// Give the tailer a moment to read.
-		time.Sleep(100 * time.Millisecond)
-	}
-
+	reg := newShadowRegistry()
 	dispatchWait := 5 * time.Second
 
 	go func() {
@@ -435,15 +428,15 @@ func startTestBroker(t *testing.T, transcript string, contextLines int) (string,
 			if err != nil {
 				return
 			}
-			go handleConn(conn, p, s, dispatchWait)
+			go handleConn(conn, p, reg, dispatchWait)
 		}
 	}()
 
-	return sock, func() { ln.Close() }
+	return sock, reg, func() { ln.Close() }
 }
 
 func TestE2EWorkerReceivesTask(t *testing.T) {
-	sock, cleanup := startTestBroker(t, "", 0)
+	sock, _, cleanup := startTestBroker(t)
 	defer cleanup()
 
 	// Register a worker.
@@ -481,7 +474,7 @@ func TestE2EWorkerReceivesTask(t *testing.T) {
 }
 
 func TestE2EDispatchQueueWaitsForWorker(t *testing.T) {
-	sock, cleanup := startTestBroker(t, "", 0)
+	sock, _, cleanup := startTestBroker(t)
 	defer cleanup()
 
 	// Dispatch first (no workers yet).
@@ -522,7 +515,7 @@ func TestE2EDispatchQueueWaitsForWorker(t *testing.T) {
 	}
 }
 
-func TestE2EShadowContextIncluded(t *testing.T) {
+func TestE2EShadowRegisterAndDispatch(t *testing.T) {
 	// Create a transcript file.
 	dir := t.TempDir()
 	txPath := filepath.Join(dir, "transcript.jsonl")
@@ -531,8 +524,23 @@ func TestE2EShadowContextIncluded(t *testing.T) {
 `
 	os.WriteFile(txPath, []byte(txContent), 0644)
 
-	sock, cleanup := startTestBroker(t, txPath, 10)
+	sock, _, cleanup := startTestBroker(t)
 	defer cleanup()
+
+	// Register shadow via protocol.
+	sConn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(sConn, "SHADOW sess1 %s 10\n", txPath)
+	resp, _ := io.ReadAll(sConn)
+	sConn.Close()
+	if strings.TrimSpace(string(resp)) != "OK" {
+		t.Fatalf("SHADOW response: got %q, want OK", resp)
+	}
+
+	// Give the tailer a moment to read.
+	time.Sleep(200 * time.Millisecond)
 
 	// Register a worker.
 	wConn, err := net.Dial("unix", sock)
@@ -543,13 +551,13 @@ func TestE2EShadowContextIncluded(t *testing.T) {
 	fmt.Fprintf(wConn, "WORKER\n")
 	time.Sleep(50 * time.Millisecond)
 
-	// Dispatch.
+	// Dispatch with session ID.
 	dConn, err := net.Dial("unix", sock)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dConn.Close()
-	fmt.Fprintf(dConn, "DISPATCH\nsolve it")
+	fmt.Fprintf(dConn, "DISPATCH  sess1\nsolve it")
 	if uc, ok := dConn.(*net.UnixConn); ok {
 		uc.CloseWrite()
 	}
@@ -571,8 +579,264 @@ func TestE2EShadowContextIncluded(t *testing.T) {
 	}
 }
 
+func TestE2EShadowContextIncluded(t *testing.T) {
+	// Create a transcript file.
+	dir := t.TempDir()
+	txPath := filepath.Join(dir, "transcript.jsonl")
+	txContent := `{"type":"user","message":{"role":"user","content":"what is 2+2?"}}
+{"type":"assistant","message":{"role":"assistant","content":"4"}}
+`
+	os.WriteFile(txPath, []byte(txContent), 0644)
+
+	sock, _, cleanup := startTestBroker(t)
+	defer cleanup()
+
+	// Register shadow via protocol.
+	sConn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(sConn, "SHADOW sess1 %s 10\n", txPath)
+	resp, _ := io.ReadAll(sConn)
+	sConn.Close()
+	if strings.TrimSpace(string(resp)) != "OK" {
+		t.Fatalf("SHADOW response: got %q, want OK", resp)
+	}
+
+	// Give the tailer a moment to read.
+	time.Sleep(200 * time.Millisecond)
+
+	// Register a worker.
+	wConn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wConn.Close()
+	fmt.Fprintf(wConn, "WORKER\n")
+	time.Sleep(50 * time.Millisecond)
+
+	// Dispatch with session.
+	dConn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dConn.Close()
+	fmt.Fprintf(dConn, "DISPATCH  sess1\nsolve it")
+	if uc, ok := dConn.(*net.UnixConn); ok {
+		uc.CloseWrite()
+	}
+
+	// Worker should receive context + task.
+	task, _ := io.ReadAll(wConn)
+	taskStr := string(task)
+	if !strings.Contains(taskStr, "CONVERSATION CONTEXT") {
+		t.Error("task should include conversation context header")
+	}
+	if !strings.Contains(taskStr, "[User]: what is 2+2?") {
+		t.Error("task should include user message from transcript")
+	}
+	if !strings.Contains(taskStr, "[Assistant]: 4") {
+		t.Error("task should include assistant message from transcript")
+	}
+	if !strings.Contains(taskStr, "TASK: solve it") {
+		t.Error("task should include the actual task text")
+	}
+}
+
+func TestE2EUnshadow(t *testing.T) {
+	dir := t.TempDir()
+	txPath := filepath.Join(dir, "transcript.jsonl")
+	txContent := `{"type":"user","message":{"role":"user","content":"hello"}}
+`
+	os.WriteFile(txPath, []byte(txContent), 0644)
+
+	sock, _, cleanup := startTestBroker(t)
+	defer cleanup()
+
+	// Register shadow.
+	sConn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(sConn, "SHADOW sess1 %s\n", txPath)
+	resp, _ := io.ReadAll(sConn)
+	sConn.Close()
+	if strings.TrimSpace(string(resp)) != "OK" {
+		t.Fatalf("SHADOW response: got %q, want OK", resp)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Unshadow.
+	uConn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(uConn, "UNSHADOW sess1\n")
+	resp, _ = io.ReadAll(uConn)
+	uConn.Close()
+	if strings.TrimSpace(string(resp)) != "OK" {
+		t.Fatalf("UNSHADOW response: got %q, want OK", resp)
+	}
+
+	// Register a worker.
+	wConn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wConn.Close()
+	fmt.Fprintf(wConn, "WORKER\n")
+	time.Sleep(50 * time.Millisecond)
+
+	// Dispatch with session — should have no context since unshadowed.
+	dConn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dConn.Close()
+	fmt.Fprintf(dConn, "DISPATCH  sess1\ndo work")
+	if uc, ok := dConn.(*net.UnixConn); ok {
+		uc.CloseWrite()
+	}
+
+	task, _ := io.ReadAll(wConn)
+	taskStr := string(task)
+	if strings.Contains(taskStr, "CONVERSATION CONTEXT") {
+		t.Error("task should NOT include conversation context after unshadow")
+	}
+	if taskStr != "do work" {
+		t.Errorf("worker should receive raw task, got %q", taskStr)
+	}
+}
+
+func TestE2EMultipleSessionsShadow(t *testing.T) {
+	dir := t.TempDir()
+
+	// Session A transcript.
+	txPathA := filepath.Join(dir, "transcriptA.jsonl")
+	os.WriteFile(txPathA, []byte(`{"type":"user","message":{"role":"user","content":"session A context"}}
+`), 0644)
+
+	// Session B transcript.
+	txPathB := filepath.Join(dir, "transcriptB.jsonl")
+	os.WriteFile(txPathB, []byte(`{"type":"user","message":{"role":"user","content":"session B context"}}
+`), 0644)
+
+	sock, _, cleanup := startTestBroker(t)
+	defer cleanup()
+
+	// Register both shadows.
+	for _, tc := range []struct {
+		sess, path string
+	}{
+		{"sessA", txPathA},
+		{"sessB", txPathB},
+	} {
+		c, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(c, "SHADOW %s %s\n", tc.sess, tc.path)
+		resp, _ := io.ReadAll(c)
+		c.Close()
+		if strings.TrimSpace(string(resp)) != "OK" {
+			t.Fatalf("SHADOW %s response: got %q", tc.sess, resp)
+		}
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Dispatch to session A.
+	wA, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wA.Close()
+	fmt.Fprintf(wA, "WORKER\n")
+	time.Sleep(50 * time.Millisecond)
+
+	dA, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dA.Close()
+	fmt.Fprintf(dA, "DISPATCH  sessA\ntask A")
+	if uc, ok := dA.(*net.UnixConn); ok {
+		uc.CloseWrite()
+	}
+
+	taskA, _ := io.ReadAll(wA)
+	taskAStr := string(taskA)
+	if !strings.Contains(taskAStr, "session A context") {
+		t.Error("task A should include session A context")
+	}
+	if strings.Contains(taskAStr, "session B context") {
+		t.Error("task A should NOT include session B context")
+	}
+
+	// Dispatch to session B.
+	wB, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wB.Close()
+	fmt.Fprintf(wB, "WORKER\n")
+	time.Sleep(50 * time.Millisecond)
+
+	dB, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dB.Close()
+	fmt.Fprintf(dB, "DISPATCH  sessB\ntask B")
+	if uc, ok := dB.(*net.UnixConn); ok {
+		uc.CloseWrite()
+	}
+
+	taskB, _ := io.ReadAll(wB)
+	taskBStr := string(taskB)
+	if !strings.Contains(taskBStr, "session B context") {
+		t.Error("task B should include session B context")
+	}
+	if strings.Contains(taskBStr, "session A context") {
+		t.Error("task B should NOT include session A context")
+	}
+}
+
+func TestShadowRegistryConcurrency(t *testing.T) {
+	reg := newShadowRegistry()
+	dir := t.TempDir()
+
+	var wg sync.WaitGroup
+
+	// Concurrent register/unregister/get.
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			sessID := fmt.Sprintf("sess-%d", n%5)
+			txPath := filepath.Join(dir, fmt.Sprintf("tx-%d.jsonl", n))
+			os.WriteFile(txPath, []byte(`{"type":"user","message":{"role":"user","content":"hi"}}
+`), 0644)
+
+			reg.register(sessID, txPath, 10)
+			_ = reg.get(sessID)
+			_ = reg.count()
+			reg.unregister(sessID)
+			_ = reg.get(sessID)
+		}(i)
+	}
+
+	wg.Wait()
+
+	// All sessions should be unregistered.
+	if c := reg.count(); c != 0 {
+		t.Errorf("registry should be empty after all unregisters, got %d", c)
+	}
+}
+
 func TestE2EStatus(t *testing.T) {
-	sock, cleanup := startTestBroker(t, "", 0)
+	sock, _, cleanup := startTestBroker(t)
 	defer cleanup()
 
 	// Add two workers.
@@ -606,6 +870,9 @@ func TestE2EStatus(t *testing.T) {
 	if !strings.Contains(respStr, "sonnet: 1") {
 		t.Errorf("status should show sonnet: 1, got %q", respStr)
 	}
+	if !strings.Contains(respStr, "shadows: 0") {
+		t.Errorf("status should show shadows: 0, got %q", respStr)
+	}
 }
 
 func TestE2ENoWorkersTimeout(t *testing.T) {
@@ -618,6 +885,7 @@ func TestE2ENoWorkersTimeout(t *testing.T) {
 	defer ln.Close()
 
 	p := &pool{}
+	reg := newShadowRegistry()
 	dispatchWait := 200 * time.Millisecond
 
 	go func() {
@@ -626,7 +894,7 @@ func TestE2ENoWorkersTimeout(t *testing.T) {
 			if err != nil {
 				return
 			}
-			go handleConn(conn, p, nil, dispatchWait)
+			go handleConn(conn, p, reg, dispatchWait)
 		}
 	}()
 
@@ -647,7 +915,7 @@ func TestE2ENoWorkersTimeout(t *testing.T) {
 }
 
 func TestE2EUnknownCommand(t *testing.T) {
-	sock, cleanup := startTestBroker(t, "", 0)
+	sock, _, cleanup := startTestBroker(t)
 	defer cleanup()
 
 	conn, err := net.Dial("unix", sock)

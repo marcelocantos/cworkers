@@ -35,10 +35,11 @@ const maxPayload = 10 << 20
 func main() {
 	args := os.Args[1:]
 	sock := defaultSockPath()
-	var transcript string
 	var timeout time.Duration
-	var contextLines int
 	var model string
+	var session string
+	var transcript string
+	var contextLines int
 	var dispatchWait time.Duration
 
 	// Parse flags.
@@ -66,6 +67,12 @@ func main() {
 				os.Exit(1)
 			}
 			args = append(args[:i], args[i+2:]...)
+		case args[i] == "--model" && i+1 < len(args):
+			model = args[i+1]
+			args = append(args[:i], args[i+2:]...)
+		case args[i] == "--session" && i+1 < len(args):
+			session = args[i+1]
+			args = append(args[:i], args[i+2:]...)
 		case args[i] == "--transcript" && i+1 < len(args):
 			transcript = args[i+1]
 			args = append(args[:i], args[i+2:]...)
@@ -76,9 +83,6 @@ func main() {
 				os.Exit(1)
 			}
 			contextLines = n
-			args = append(args[:i], args[i+2:]...)
-		case args[i] == "--model" && i+1 < len(args):
-			model = args[i+1]
 			args = append(args[:i], args[i+2:]...)
 		case args[i] == "--wait" && i+1 < len(args):
 			var err error
@@ -103,7 +107,7 @@ func main() {
 
 	switch args[0] {
 	case "serve":
-		serve(sock, transcript, contextLines, dispatchWait)
+		serve(sock, dispatchWait)
 	case "worker":
 		worker(sock, timeout, model)
 	case "dispatch":
@@ -111,7 +115,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usage: cworkers dispatch <task>")
 			os.Exit(1)
 		}
-		dispatch(sock, strings.Join(args[1:], " "), model)
+		dispatch(sock, strings.Join(args[1:], " "), model, session)
+	case "shadow":
+		shadowCmd(sock, session, transcript, contextLines)
+	case "unshadow":
+		unshadowCmd(sock, session)
 	case "status":
 		status(sock)
 	default:
@@ -125,16 +133,21 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, `usage: cworkers <command> [flags]
 
 commands:
-  serve     Start the broker
-              --transcript <path>  JSONL transcript to shadow
-              --context <N>        Number of recent messages to keep (default: 50)
-              --wait <dur>         Max time to wait for a worker on dispatch (default: 30s)
-  worker    Block until a task arrives, print it
-              --timeout <dur>      Total lifetime before exit (e.g. 590s)
-              --model <name>       Register as a specific model (e.g. opus, sonnet)
-  dispatch  Send a task to an available worker
-              --model <name>       Route to a specific model worker
-  status    Show pool size by model
+  serve      Start the broker
+               --wait <dur>         Max time to wait for a worker on dispatch (default: 30s)
+  worker     Block until a task arrives, print it
+               --timeout <dur>      Total lifetime before exit (e.g. 590s)
+               --model <name>       Register as a specific model (e.g. opus, sonnet)
+  dispatch   Send a task to an available worker
+               --model <name>       Route to a specific model worker
+               --session <id>       Use shadow context from this session
+  shadow     Register a session transcript for context injection
+               --session <id>       Session identifier (required)
+               --transcript <path>  JSONL transcript to shadow (required)
+               --context <N>        Number of recent messages to keep (default: 50)
+  unshadow   Remove a session's shadow registration
+               --session <id>       Session identifier (required)
+  status     Show pool size by model and shadow count
 
 global flags:
   --sock <path>    Unix socket path (default: %s)
@@ -162,13 +175,17 @@ type shadow struct {
 	mu       sync.RWMutex
 	messages []string
 	maxLines int
+	done     chan struct{}
 }
 
 func newShadow(maxLines int) *shadow {
 	if maxLines <= 0 {
 		maxLines = 50
 	}
-	return &shadow{maxLines: maxLines}
+	return &shadow{
+		maxLines: maxLines,
+		done:     make(chan struct{}),
+	}
 }
 
 func (s *shadow) add(msg string) {
@@ -187,6 +204,64 @@ func (s *shadow) snapshot() string {
 		return ""
 	}
 	return strings.Join(s.messages, "\n\n")
+}
+
+func (s *shadow) stop() {
+	select {
+	case <-s.done:
+		// Already closed.
+	default:
+		close(s.done)
+	}
+}
+
+// --- Shadow Registry ---
+
+type shadowRegistry struct {
+	mu       sync.RWMutex
+	sessions map[string]*shadow // session-id → shadow
+}
+
+func newShadowRegistry() *shadowRegistry {
+	return &shadowRegistry{
+		sessions: make(map[string]*shadow),
+	}
+}
+
+func (r *shadowRegistry) register(sessionID, transcriptPath string, contextLines int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// If there's an existing shadow for this session, stop it first.
+	if old, ok := r.sessions[sessionID]; ok {
+		old.stop()
+	}
+
+	s := newShadow(contextLines)
+	r.sessions[sessionID] = s
+	go tailTranscript(transcriptPath, s)
+}
+
+func (r *shadowRegistry) unregister(sessionID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if s, ok := r.sessions[sessionID]; ok {
+		s.stop()
+		delete(r.sessions, sessionID)
+	}
+}
+
+func (r *shadowRegistry) get(sessionID string) *shadow {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.sessions[sessionID]
+}
+
+func (r *shadowRegistry) count() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.sessions)
 }
 
 func extractText(raw json.RawMessage) string {
@@ -238,7 +313,11 @@ func tailTranscript(path string, s *shadow) {
 			return
 		}
 		// EOF — wait for more data and reset the scanner on the same file handle.
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-s.done:
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
 		scanner = bufio.NewScanner(f)
 		scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 	}
@@ -401,7 +480,7 @@ func (p *pool) drain() {
 
 // --- Serve ---
 
-func serve(sock, transcript string, contextLines int, dispatchWait time.Duration) {
+func serve(sock string, dispatchWait time.Duration) {
 	os.Remove(sock)
 
 	if dispatchWait <= 0 {
@@ -421,6 +500,7 @@ func serve(sock, transcript string, contextLines int, dispatchWait time.Duration
 	fmt.Fprintf(os.Stderr, "broker: listening on %s (dispatch wait: %s)\n", sock, dispatchWait)
 
 	p := &pool{}
+	reg := newShadowRegistry()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -428,13 +508,6 @@ func serve(sock, transcript string, contextLines int, dispatchWait time.Duration
 		<-sig
 		ln.Close()
 	}()
-
-	var s *shadow
-
-	if transcript != "" {
-		s = newShadow(contextLines)
-		go tailTranscript(transcript, s)
-	}
 
 	for {
 		conn, err := ln.Accept()
@@ -445,7 +518,7 @@ func serve(sock, transcript string, contextLines int, dispatchWait time.Duration
 			fmt.Fprintf(os.Stderr, "broker: accept: %v\n", err)
 			continue
 		}
-		go handleConn(conn, p, s, dispatchWait)
+		go handleConn(conn, p, reg, dispatchWait)
 	}
 
 	fmt.Fprintf(os.Stderr, "broker: shutting down\n")
@@ -453,7 +526,7 @@ func serve(sock, transcript string, contextLines int, dispatchWait time.Duration
 	os.Remove(sock)
 }
 
-func handleConn(conn net.Conn, p *pool, s *shadow, dispatchWait time.Duration) {
+func handleConn(conn net.Conn, p *pool, reg *shadowRegistry, dispatchWait time.Duration) {
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadString('\n')
 	if err != nil {
@@ -467,13 +540,13 @@ func handleConn(conn net.Conn, p *pool, s *shadow, dispatchWait time.Duration) {
 		return
 	}
 	cmd := parts[0]
-	model := ""
-	if len(parts) > 1 {
-		model = parts[1]
-	}
 
 	switch cmd {
 	case "WORKER":
+		model := ""
+		if len(parts) > 1 {
+			model = parts[1]
+		}
 		p.add(conn, model)
 		if model != "" {
 			fmt.Fprintf(os.Stderr, "broker: worker registered [%s] (pool: %d)\n", model, p.count())
@@ -482,6 +555,15 @@ func handleConn(conn net.Conn, p *pool, s *shadow, dispatchWait time.Duration) {
 		}
 
 	case "DISPATCH":
+		model := ""
+		session := ""
+		if len(parts) > 1 {
+			model = parts[1]
+		}
+		if len(parts) > 2 {
+			session = parts[2]
+		}
+
 		// Deadline prevents a stuck caller from holding a goroutine forever.
 		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		task, err := io.ReadAll(io.LimitReader(reader, maxPayload))
@@ -494,6 +576,10 @@ func handleConn(conn net.Conn, p *pool, s *shadow, dispatchWait time.Duration) {
 
 		// Build payload with shadow context.
 		var payload []byte
+		var s *shadow
+		if session != "" {
+			s = reg.get(session)
+		}
 		if s != nil {
 			ctx := s.snapshot()
 			if ctx != "" {
@@ -557,6 +643,41 @@ func handleConn(conn net.Conn, p *pool, s *shadow, dispatchWait time.Duration) {
 			}
 		}
 
+	case "SHADOW":
+		if len(parts) < 3 {
+			fmt.Fprintf(conn, "ERROR: usage: SHADOW <session-id> <transcript-path> [context-lines]\n")
+			conn.Close()
+			return
+		}
+		sessionID := parts[1]
+		txPath := parts[2]
+		ctxLines := 50
+		if len(parts) > 3 {
+			n, err := strconv.Atoi(parts[3])
+			if err != nil {
+				fmt.Fprintf(conn, "ERROR: bad context-lines: %v\n", err)
+				conn.Close()
+				return
+			}
+			ctxLines = n
+		}
+		reg.register(sessionID, txPath, ctxLines)
+		fmt.Fprintf(os.Stderr, "broker: shadow registered [%s] -> %s (context: %d)\n", sessionID, txPath, ctxLines)
+		fmt.Fprintf(conn, "OK\n")
+		conn.Close()
+
+	case "UNSHADOW":
+		if len(parts) < 2 {
+			fmt.Fprintf(conn, "ERROR: usage: UNSHADOW <session-id>\n")
+			conn.Close()
+			return
+		}
+		sessionID := parts[1]
+		reg.unregister(sessionID)
+		fmt.Fprintf(os.Stderr, "broker: shadow unregistered [%s]\n", sessionID)
+		fmt.Fprintf(conn, "OK\n")
+		conn.Close()
+
 	case "STATUS":
 		var sb strings.Builder
 		counts := p.counts()
@@ -573,9 +694,7 @@ func handleConn(conn net.Conn, p *pool, s *shadow, dispatchWait time.Duration) {
 			}
 			fmt.Fprintf(&sb, ")")
 		}
-		if s != nil {
-			fmt.Fprintf(&sb, ", shadow: %d bytes", len(s.snapshot()))
-		}
+		fmt.Fprintf(&sb, ", shadows: %d", reg.count())
 		fmt.Fprintf(&sb, "\n")
 		fmt.Fprint(conn, sb.String())
 		conn.Close()
@@ -649,7 +768,7 @@ func workerTryOnce(sock, model string, wait time.Duration) []byte {
 
 const exitNoWorkers = 2
 
-func dispatch(sock, task, model string) {
+func dispatch(sock, task, model, session string) {
 	conn, err := net.Dial("unix", sock)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "dispatch: connect: %v\n", err)
@@ -657,11 +776,7 @@ func dispatch(sock, task, model string) {
 	}
 	defer conn.Close()
 
-	if model != "" {
-		fmt.Fprintf(conn, "DISPATCH %s\n%s", model, task)
-	} else {
-		fmt.Fprintf(conn, "DISPATCH\n%s", task)
-	}
+	fmt.Fprintf(conn, "DISPATCH %s %s\n%s", model, session, task)
 
 	if uc, ok := conn.(*net.UnixConn); ok {
 		uc.CloseWrite()
@@ -678,6 +793,62 @@ func dispatch(sock, task, model string) {
 	if strings.TrimSpace(string(resp)) == "NO_WORKERS" {
 		os.Exit(exitNoWorkers)
 	}
+}
+
+// --- Shadow / Unshadow CLI ---
+
+func shadowCmd(sock, session, transcript string, contextLines int) {
+	if session == "" {
+		fmt.Fprintln(os.Stderr, "shadow: --session is required")
+		os.Exit(1)
+	}
+	if transcript == "" {
+		fmt.Fprintln(os.Stderr, "shadow: --transcript is required")
+		os.Exit(1)
+	}
+
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "shadow: connect: %v\n", err)
+		os.Exit(1)
+	}
+	defer conn.Close()
+
+	if contextLines > 0 {
+		fmt.Fprintf(conn, "SHADOW %s %s %d\n", session, transcript, contextLines)
+	} else {
+		fmt.Fprintf(conn, "SHADOW %s %s\n", session, transcript)
+	}
+
+	resp, err := io.ReadAll(conn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "shadow: read: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Print(string(resp))
+}
+
+func unshadowCmd(sock, session string) {
+	if session == "" {
+		fmt.Fprintln(os.Stderr, "unshadow: --session is required")
+		os.Exit(1)
+	}
+
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "unshadow: connect: %v\n", err)
+		os.Exit(1)
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "UNSHADOW %s\n", session)
+
+	resp, err := io.ReadAll(conn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "unshadow: read: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Print(string(resp))
 }
 
 // --- Status ---

@@ -8,13 +8,19 @@ tasks to pre-spawned worker agents.
 1. **Start the broker** at the beginning of your session:
 
    ```bash
-   cworkers serve --transcript /path/to/session.jsonl &
+   cworkers serve &
    ```
 
-   The `--transcript` flag enables shadow mode — workers automatically
-   receive recent conversation context from your session.
+2. **Register your session's transcript** for shadow mode:
 
-2. **Spawn workers** as background bash calls:
+   ```bash
+   cworkers shadow --session my-session --transcript /path/to/session.jsonl
+   ```
+
+   This tells the broker to tail the transcript and inject recent conversation
+   context into tasks dispatched for this session.
+
+3. **Spawn workers** as background bash calls:
 
    ```bash
    cworkers worker --model opus --timeout 590s &
@@ -24,21 +30,35 @@ tasks to pre-spawned worker agents.
    Workers block until they receive a task or their timeout expires.
    The 590s timeout stays within the 600s bash tool limit.
 
-3. **Dispatch tasks** when you need to delegate:
+4. **Dispatch tasks** when you need to delegate:
 
    ```bash
-   cworkers dispatch --model opus "Analyze the error handling in src/api/"
+   cworkers dispatch --session my-session --model opus "Analyze the error handling in src/api/"
    ```
 
-   The response is either `OK` (task delivered) or `NO_WORKERS` (exit code 2).
+   The `--session` flag tells the broker which session's shadow context to
+   inject. The response is either `OK` (task delivered) or `NO_WORKERS`
+   (exit code 2).
 
-4. **Check pool status** at any time:
+5. **Check pool status** at any time:
 
    ```bash
    cworkers status
    ```
 
-   Output: `WORKERS: 3 (opus: 1, sonnet: 2), shadow: 4096 bytes`
+   Output: `WORKERS: 3 (opus: 1, sonnet: 2), shadows: 2`
+
+6. **Remove shadow** when your session ends:
+
+   ```bash
+   cworkers unshadow --session my-session
+   ```
+
+## Multi-Session Support
+
+The broker is global (one per user). Multiple Claude Code sessions share
+a single broker, each registering its own transcript via `shadow`. Dispatches
+include a `--session` flag to select which session's context to inject.
 
 ## Model Routing
 

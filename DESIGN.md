@@ -20,10 +20,12 @@ session is doing without the root paying the token cost of inline work.
    |
    |  (spawns at session start)
    |
-   +---> cworkers serve                # broker process
+   +---> cworkers serve                # broker process (global, one per user)
    |       - Unix socket listener
-   |       - transcript tailer (shadow)
+   |       - shadow registry (per-session transcripts)
    |       - worker pool + dispatch queue
+   |
+   +---> cworkers shadow --session S1 --transcript /path/to/session.jsonl
    |
    +---> agent: cworkers worker --model opus    # pre-spawned workers
    +---> agent: cworkers worker --model opus    #   (idle, waiting)
@@ -32,14 +34,15 @@ session is doing without the root paying the token cost of inline work.
    |
    |  (when root needs to delegate)
    |
-   +---> cworkers dispatch --model opus "Analyze the code in src/"
+   +---> cworkers dispatch --session S1 --model opus "Analyze the code in src/"
+            -> broker looks up session S1's shadow
             -> broker matches to pooled opus worker
-            -> worker receives task + conversation context
+            -> worker receives task + session S1's conversation context
             -> worker executes, returns result to root via tool output
 ```
 
-The entire system is a single Go binary (zero dependencies) with four
-subcommands: `serve`, `worker`, `dispatch`, `status`.
+The entire system is a single Go binary (zero dependencies) with six
+subcommands: `serve`, `worker`, `dispatch`, `shadow`, `unshadow`, `status`.
 
 ## Protocol
 
@@ -58,26 +61,51 @@ Server: (connection closed cleanly on timeout)
 ### Task Dispatch
 
 ```
-Client: DISPATCH <model>\n<task body>
+Client: DISPATCH <model> <session>\n<task body>
 Client: (half-close write side)
 Server: OK\n          (task delivered)
 Server: NO_WORKERS\n  (no matching worker within wait period)
 ```
 
+The `<model>` and `<session>` fields are space-separated. Either can be empty
+(empty = no filtering / no context injection).
+
+### Shadow Registration
+
+```
+Client: SHADOW <session-id> <transcript-path> [context-lines]\n
+Server: OK\n
+```
+
+Registers a session's JSONL transcript for tailing. `context-lines` defaults
+to 50. If the session already has a shadow, the old one is replaced.
+
+### Shadow Removal
+
+```
+Client: UNSHADOW <session-id>\n
+Server: OK\n
+```
+
+Stops tailing and removes the session's shadow.
+
 ### Status Query
 
 ```
 Client: STATUS\n
-Server: WORKERS: 4 (opus: 2, sonnet: 2), shadow: 15234 bytes\n
+Server: WORKERS: 4 (opus: 2, sonnet: 2), shadows: 2\n
 ```
 
 ## Shadow Mode
 
-When started with `--transcript <path>`, the broker tails the root session's
-JSONL transcript file and maintains a rolling window of recent user/assistant
-messages (default 50, configurable via `--context`).
+Sessions register their transcripts dynamically via the `SHADOW` command
+(or the `cworkers shadow` CLI subcommand). The broker maintains a
+`shadowRegistry` mapping session IDs to shadow instances, each tailing its
+own JSONL transcript file with a rolling window of recent user/assistant
+messages (default 50, configurable per-session).
 
-When dispatching a task, the broker prepends this context:
+When dispatching a task with a session ID, the broker looks up that session's
+shadow and prepends the context:
 
 ```
 === CONVERSATION CONTEXT (recent messages from root session) ===
@@ -94,7 +122,8 @@ needing to summarize or repeat anything.
 
 The tailer uses manual byte-offset tracking (not `Seek`-based) to avoid a
 partial-line duplication bug identified during architecture review. Incomplete
-lines are buffered across reads.
+lines are buffered across reads. Each shadow has a `done` channel; closing it
+(via `UNSHADOW` or re-registration) cleanly stops the tailer goroutine.
 
 ## Model Routing
 
@@ -132,7 +161,8 @@ cycling; it either gets a task printed to stdout or the process exits cleanly.
 
 - **Socket path is per-user, not per-session**: `/tmp/cworkers-<uid>.sock`
   avoids collisions between users but not between concurrent sessions of the
-  same user. Use `--sock` to disambiguate.
+  same user. Use `--sock` to disambiguate if needed (though multi-session
+  shadow mode means a single broker can serve all sessions).
 
 - **No task acknowledgment**: Once the broker writes a task to a worker
   connection, it considers the task delivered. If the worker crashes mid-
