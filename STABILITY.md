@@ -9,7 +9,7 @@ forking to a new product). The pre-1.0 period exists to get these right.
 
 ## Interaction Surface Catalogue
 
-Snapshot as of v0.4.0.
+Snapshot as of v0.5.0.
 
 ### CLI Subcommands
 
@@ -33,7 +33,7 @@ Snapshot as of v0.4.0.
 | `--wait <dur>` | serve | duration | 30s | Stable |
 | `--timeout <dur>` | worker | duration | 590s | Stable |
 | `--model <name>` | worker, dispatch | string | "" (wildcard) | Stable |
-| `--session <id>` | dispatch, shadow, unshadow | string | "" | Needs review |
+| `--session <id>` | dispatch, shadow, unshadow, status | string | "" | Needs review |
 | `--transcript <path>` | shadow | string | — (required) | Needs review |
 | `--context <N>` | shadow | int | 50 | Needs review |
 
@@ -47,7 +47,7 @@ Line-based text over Unix domain socket.
 | `DISPATCH` | `DISPATCH <model> <session>\n<task body>` | Needs review — positional empty-field encoding is fragile. |
 | `SHADOW` | `SHADOW <session-id> <transcript-path> [context-lines]\n` | Needs review |
 | `UNSHADOW` | `UNSHADOW <session-id>\n` | Needs review |
-| `STATUS` | `STATUS\n` | Stable |
+| `STATUS` | `STATUS [<session-id>]\n` | Needs review — session-scoped variant is new. |
 
 ### Wire Protocol Responses
 
@@ -56,7 +56,8 @@ Line-based text over Unix domain socket.
 | `OK\n` | Success (dispatch delivered, shadow registered, etc.) | Stable |
 | `NO_WORKERS\n` | No matching worker within wait period | Stable |
 | `ERROR: <msg>\n` | Protocol or validation error | Stable |
-| `WORKERS: N (model: n, ...), shadows: M\n` | Status output | Needs review — format may gain fields. |
+| `WORKERS: N (model: n, ...), shadows: M\n` | Global status output | Needs review — format may gain fields. |
+| `SESSION: <id>, shadow: <bool>, available_workers: N (model: n, ...)\n` | Session-scoped status output | Needs review — new in v0.5.0. |
 
 ### Exit Codes
 
