@@ -52,25 +52,25 @@ UUID). Shadow mode tails the transcript and maintains a rolling window of
 recent messages. When you dispatch tasks, workers automatically receive this
 context.
 
-**Do not spawn workers upfront.** The pool starts empty and warms itself
-on demand — see "Self-warming pool" below.
+**Always decide to delegate as if a worker is available.** Don't check
+pool status before deciding *whether* to delegate — only check it to
+choose *how*: dispatch (if a worker is idle) or spawn a regular Agent
+(if the pool is cold). Either way, the work gets delegated and the
+self-warming chain starts or continues.
+
+This matters because the pool can be empty at session start or after an
+idle timeout. If you gate delegation decisions on pool status, work stays
+in the root session unnecessarily and the pool never warms up.
 
 ## Dispatching Tasks
 
-**Always prefer cworkers over the Agent tool when an idle worker is
-available.** Workers have zero startup overhead and automatic context
-injection — the Agent tool should only be used as a fallback.
+First decide *whether* to delegate (see "When to Delegate" above), then
+decide *how*:
 
-When you need to delegate work:
-
-1. **Check for an idle worker**: `cworkers status --session <session-id>`
-2. **If a worker is available**: dispatch directly:
-   ```bash
-   cworkers dispatch --session <session-id> --model sonnet "Analyze the error handling in src/api/"
-   ```
-3. **If no worker is available**: spawn a regular Agent instead (it pays
-   the startup cost anyway). The agent will prime the pool before doing
-   its work — see below.
+1. **Try dispatching**: `cworkers dispatch --session <session-id> --model sonnet "your task"`
+2. **If OK**: done — the worker handles it.
+3. **If NO_WORKERS** (exit code 2): spawn a regular Agent with the same
+   task. The agent seeds the pool before doing its work (see below).
 
 - `--session` injects your conversation context into the task
 - `--model` routes to a worker with the matching tag

@@ -50,3 +50,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `505506d`
 - **Outcome**: Released v0.9.0 (darwin-arm64, linux-amd64, linux-arm64). Self-warming worker pool: workers spawn replacements before doing work, replacing upfront pool spawning. Removed haiku from model selection. Added burst/team exclusion rules. Homebrew formula updated.
+
+## 2026-03-11 — /release v0.10.0
+
+- **Commit**: `f9a130a`
+- **Outcome**: Released v0.10.0 (darwin-arm64, linux-amd64, linux-arm64). Fixed cold-pool bootstrapping: delegation decisions no longer gated on pool status. Dispatch-first flow with Agent fallback. Homebrew formula updated.

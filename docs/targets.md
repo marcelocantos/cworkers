@@ -14,7 +14,7 @@
   - STABILITY.md version snapshot updated
   - Audit log entry written
 - **Context**: The self-warming pool redesign (commit `505506d`) is on master but not yet tagged or released. Every worker instance spawns a replacement before doing work, replacing the upfront pool spawning ceremony. Haiku removed from model selection.
-- **Status**: converging
+- **Status**: achieved
 - **Discovered**: 2026-03-11
 
 ### 🎯T4 cworkers binary detects stale ~/.claude instructions
