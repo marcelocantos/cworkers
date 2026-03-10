@@ -38,8 +38,8 @@ session is doing without the root paying the token cost of inline work.
             -> worker executes, returns result to root via tool output
 ```
 
-The entire system is a single Go binary (~280 lines, zero dependencies) with
-four subcommands: `serve`, `worker`, `dispatch`, `status`.
+The entire system is a single Go binary (zero dependencies) with four
+subcommands: `serve`, `worker`, `dispatch`, `status`.
 
 ## Protocol
 

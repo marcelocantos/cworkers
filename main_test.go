@@ -664,6 +664,80 @@ func TestE2EUnknownCommand(t *testing.T) {
 	}
 }
 
+// --- processLine: empty role guard ---
+
+func TestProcessLineEmptyRole(t *testing.T) {
+	s := newShadow(10)
+	line := `{"type":"user","message":{"role":"","content":"should be skipped"}}`
+	processLine([]byte(line), s)
+
+	if snap := s.snapshot(); snap != "" {
+		t.Errorf("processLine should skip empty role, got %q", snap)
+	}
+}
+
+// --- workerTryOnce ---
+
+func TestWorkerTryOnceNoServer(t *testing.T) {
+	result := workerTryOnce("/tmp/cworkers-nonexistent-test.sock", "opus", 100*time.Millisecond)
+	if result != nil {
+		t.Errorf("workerTryOnce with no server should return nil, got %q", result)
+	}
+}
+
+func TestWorkerTryOnceReceivesTask(t *testing.T) {
+	sock := tempSock(t)
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		reader := bufio.NewReader(conn)
+		reader.ReadString('\n')
+		conn.Write([]byte("test task payload"))
+		conn.Close()
+	}()
+
+	result := workerTryOnce(sock, "opus", 3*time.Second)
+	if string(result) != "test task payload" {
+		t.Errorf("workerTryOnce: got %q, want 'test task payload'", result)
+	}
+}
+
+func TestWorkerTryOnceTimeout(t *testing.T) {
+	sock := tempSock(t)
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, _ := ln.Accept()
+		if conn != nil {
+			defer conn.Close()
+			time.Sleep(2 * time.Second)
+		}
+	}()
+
+	start := time.Now()
+	result := workerTryOnce(sock, "", 200*time.Millisecond)
+	elapsed := time.Since(start)
+
+	if result != nil {
+		t.Errorf("workerTryOnce should return nil on timeout, got %q", result)
+	}
+	if elapsed > time.Second {
+		t.Errorf("workerTryOnce should time out quickly, took %s", elapsed)
+	}
+}
+
 // --- Pool drain ---
 
 func TestPoolDrain(t *testing.T) {

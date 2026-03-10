@@ -5,21 +5,32 @@ package main
 
 import (
 	"bufio"
+	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
 
+//go:embed agents-guide.md
+var agentGuide string
+
+var version = "dev"
+
 func defaultSockPath() string {
 	return fmt.Sprintf("/tmp/cworkers-%d.sock", os.Getuid())
 }
+
+// maxPayload is the maximum size of a dispatch task payload (10 MB).
+const maxPayload = 10 << 20
 
 func main() {
 	args := os.Args[1:]
@@ -33,6 +44,17 @@ func main() {
 	// Parse flags.
 	for i := 0; i < len(args); {
 		switch {
+		case args[i] == "--version":
+			fmt.Println(version)
+			return
+		case args[i] == "--help" || args[i] == "-h":
+			printUsage(os.Stdout)
+			return
+		case args[i] == "--help-agent":
+			printUsage(os.Stdout)
+			fmt.Println()
+			fmt.Print(agentGuide)
+			return
 		case args[i] == "--sock" && i+1 < len(args):
 			sock = args[i+1]
 			args = append(args[:i], args[i+2:]...)
@@ -48,7 +70,12 @@ func main() {
 			transcript = args[i+1]
 			args = append(args[:i], args[i+2:]...)
 		case args[i] == "--context" && i+1 < len(args):
-			fmt.Sscanf(args[i+1], "%d", &contextLines)
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "bad --context: %v\n", err)
+				os.Exit(1)
+			}
+			contextLines = n
 			args = append(args[:i], args[i+2:]...)
 		case args[i] == "--model" && i+1 < len(args):
 			model = args[i+1]
@@ -61,13 +88,17 @@ func main() {
 				os.Exit(1)
 			}
 			args = append(args[:i], args[i+2:]...)
+		case strings.HasPrefix(args[i], "-"):
+			fmt.Fprintf(os.Stderr, "unknown flag: %s\n", args[i])
+			os.Exit(1)
 		default:
 			i++
 		}
 	}
 
 	if len(args) == 0 {
-		usage()
+		printUsage(os.Stderr)
+		os.Exit(1)
 	}
 
 	switch args[0] {
@@ -84,12 +115,14 @@ func main() {
 	case "status":
 		status(sock)
 	default:
-		usage()
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
+		printUsage(os.Stderr)
+		os.Exit(1)
 	}
 }
 
-func usage() {
-	fmt.Fprintf(os.Stderr, `usage: cworkers <command> [flags]
+func printUsage(w io.Writer) {
+	fmt.Fprintf(w, `usage: cworkers <command> [flags]
 
 commands:
   serve     Start the broker
@@ -104,9 +137,11 @@ commands:
   status    Show pool size by model
 
 global flags:
-  --sock <path>  Unix socket path (default: %s)
+  --sock <path>    Unix socket path (default: %s)
+  --version        Print version and exit
+  --help           Show this help
+  --help-agent     Show help plus agent integration guide
 `, defaultSockPath())
-	os.Exit(1)
 }
 
 // --- Transcript shadow ---
@@ -227,7 +262,7 @@ func processLine(line []byte, s *shadow) {
 	}
 
 	text := extractText(env.Content)
-	if text == "" {
+	if text == "" || env.Role == "" {
 		return
 	}
 
@@ -379,6 +414,10 @@ func serve(sock, transcript string, contextLines int, dispatchWait time.Duration
 		os.Exit(1)
 	}
 
+	if err := os.Chmod(sock, 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "broker: chmod socket: %v\n", err)
+	}
+
 	fmt.Fprintf(os.Stderr, "broker: listening on %s (dispatch wait: %s)\n", sock, dispatchWait)
 
 	p := &pool{}
@@ -387,12 +426,9 @@ func serve(sock, transcript string, contextLines int, dispatchWait time.Duration
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sig
-		fmt.Fprintf(os.Stderr, "broker: shutting down\n")
 		ln.Close()
-		p.drain()
-		os.Remove(sock)
-		os.Exit(0)
 	}()
+
 	var s *shadow
 
 	if transcript != "" {
@@ -403,10 +439,18 @@ func serve(sock, transcript string, contextLines int, dispatchWait time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				break
+			}
+			fmt.Fprintf(os.Stderr, "broker: accept: %v\n", err)
 			continue
 		}
 		go handleConn(conn, p, s, dispatchWait)
 	}
+
+	fmt.Fprintf(os.Stderr, "broker: shutting down\n")
+	p.drain()
+	os.Remove(sock)
 }
 
 func handleConn(conn net.Conn, p *pool, s *shadow, dispatchWait time.Duration) {
@@ -440,7 +484,7 @@ func handleConn(conn net.Conn, p *pool, s *shadow, dispatchWait time.Duration) {
 	case "DISPATCH":
 		// Deadline prevents a stuck caller from holding a goroutine forever.
 		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		task, err := io.ReadAll(reader)
+		task, err := io.ReadAll(io.LimitReader(reader, maxPayload))
 		conn.SetReadDeadline(time.Time{}) // clear for response write
 		if err != nil {
 			fmt.Fprintf(conn, "ERROR: %v\n", err)
@@ -557,10 +601,7 @@ func worker(sock string, timeout time.Duration, model string) {
 
 	for time.Now().Before(deadline) {
 		remaining := time.Until(deadline)
-		wait := reconnectInterval
-		if remaining < wait {
-			wait = remaining
-		}
+		wait := min(reconnectInterval, remaining)
 
 		task := workerTryOnce(sock, model, wait)
 		if task != nil {
@@ -591,7 +632,7 @@ func workerTryOnce(sock, model string, wait time.Duration) []byte {
 
 	conn.SetReadDeadline(time.Now().Add(wait))
 
-	task, err := io.ReadAll(conn)
+	task, err := io.ReadAll(io.LimitReader(conn, maxPayload))
 	if err != nil {
 		if ne, ok := err.(net.Error); ok && ne.Timeout() {
 			return nil
