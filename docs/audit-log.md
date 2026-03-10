@@ -20,3 +20,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `f5d4b04`
 - **Outcome**: Released v0.3.0 (darwin-arm64, linux-amd64, linux-arm64). Broker runs as brew service. Homebrew formula updated with service block.
+
+## 2026-03-11 — /release v0.4.0
+
+- **Commit**: `802cc2f`
+- **Outcome**: Released v0.4.0 (darwin-arm64, linux-amd64, linux-arm64). Added delegation guidance and model selection to operational guide.
