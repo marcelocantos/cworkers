@@ -9,20 +9,24 @@ The broker runs as a brew service — it is always available.
 
 ## When to Delegate
 
-Delegate to a worker when the task is **independent** — it doesn't need
-your conversation's back-and-forth, and you can continue other work while
-it runs. Good candidates:
+**Default to delegating.** Every tool call, file read, search, build, or
+test you run in the root session grows your context window and brings you
+closer to compression or session death. Workers absorb that cost instead.
 
-- **Research**: Exploring a codebase area, reading docs, gathering context
-- **Bulk changes**: Applying the same pattern across multiple files
-- **Testing**: Running test suites, diagnosing failures
-- **Code review**: Auditing a module, checking for issues
-- **Parallel implementation**: Building independent features or components
+Delegate aggressively:
+- **Any file reads or searches** — send a worker to explore and summarise
+- **Code changes** — describe what to change, let a worker implement it
+- **Builds and tests** — workers run them and report results
+- **Research** — codebase exploration, doc reading, dependency analysis
+- **Bulk work** — applying patterns across files, migrations, refactors
 
-Do **not** delegate when:
-- The task requires interactive decisions with the user
-- The result is needed immediately before you can continue
-- The task is trivial (faster to do inline than to dispatch)
+The only things that **must** stay in the root session:
+- Direct conversation with the user (clarifying questions, presenting options)
+- Orchestration decisions (what to do next based on worker results)
+- Trivial operations under ~100 tokens (not worth the dispatch overhead)
+
+Everything else should be dispatched. If you're about to read a file or run
+a command, ask yourself: can a worker do this instead? Usually yes.
 
 ## Model Selection
 
@@ -103,6 +107,14 @@ cworkers status
 
 Output: `WORKERS: 3 (opus: 1, sonnet: 2), shadows: 1`
 
+For session-scoped status (is my shadow registered? are workers available?):
+
+```bash
+cworkers status --session <session-id>
+```
+
+Output: `SESSION: my-sess, shadow: true, available_workers: 3 (opus: 1, sonnet: 2)`
+
 ## Cleanup
 
 When your session ends, remove the shadow registration:
@@ -120,6 +132,6 @@ cworkers unshadow --session <session-id>
 | `dispatch` | `--model <name>`, `--session <id>` |
 | `shadow` | `--session <id>` (required), `--transcript <path>` (required), `--context <N>` (default 50) |
 | `unshadow` | `--session <id>` (required) |
-| `status` | (no flags) |
+| `status` | `--session <id>` (optional, session-scoped status) |
 
 Global: `--sock <path>` overrides the default socket path.
