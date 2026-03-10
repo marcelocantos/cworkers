@@ -35,3 +35,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `8c86c2d`
 - **Outcome**: Released v0.6.0 (darwin-arm64, linux-amd64, linux-arm64). Fixed Homebrew version detection (was showing "64" instead of semver) by adding explicit `version` input to homebrew-releaser workflow.
+
+## 2026-03-11 — /release v0.7.0
+
+- **Commit**: `c059ae9`
+- **Outcome**: Released v0.7.0 (darwin-arm64, linux-amd64, linux-arm64). Session-scoped workers: `--session` required for worker command, broker routes dispatches only to same-session workers. Breaking WORKER protocol change (pre-1.0). Homebrew formula updated.
