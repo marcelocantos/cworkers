@@ -534,12 +534,22 @@ func handleConn(conn net.Conn, p *pool, reg *shadowRegistry, dispatchWait time.D
 		return
 	}
 
-	parts := strings.Fields(strings.TrimSpace(line))
-	if len(parts) == 0 {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
 		conn.Close()
 		return
 	}
-	cmd := parts[0]
+
+	// Split the command line preserving empty fields between spaces.
+	// The protocol uses positional fields: "DISPATCH <model> <session>"
+	// where either field can be empty. strings.Fields would collapse
+	// consecutive spaces and lose the empty model field.
+	cmdParts := strings.SplitN(trimmed, " ", 2)
+	cmd := cmdParts[0]
+
+	// For commands other than DISPATCH, Fields-style parsing is fine
+	// since they don't have optional positional empty fields.
+	parts := strings.Fields(trimmed)
 
 	switch cmd {
 	case "WORKER":
@@ -555,13 +565,21 @@ func handleConn(conn net.Conn, p *pool, reg *shadowRegistry, dispatchWait time.D
 		}
 
 	case "DISPATCH":
+		// Parse "DISPATCH <model> <session>" with positional fields.
+		// Split into exactly 4 parts (cmd, model, session, rest) to
+		// preserve empty fields. "DISPATCH  sess1" => ["DISPATCH", "", "sess1"].
+		dispatchArgs := ""
+		if len(cmdParts) > 1 {
+			dispatchArgs = cmdParts[1]
+		}
+		argFields := strings.SplitN(dispatchArgs, " ", 2)
 		model := ""
 		session := ""
-		if len(parts) > 1 {
-			model = parts[1]
+		if len(argFields) > 0 {
+			model = argFields[0]
 		}
-		if len(parts) > 2 {
-			session = parts[2]
+		if len(argFields) > 1 {
+			session = argFields[1]
 		}
 
 		// Deadline prevents a stuck caller from holding a goroutine forever.
