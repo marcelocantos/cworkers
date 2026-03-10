@@ -15,3 +15,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `2a567c3`
 - **Outcome**: Released v0.2.0 (darwin-arm64, linux-amd64, linux-arm64). Split agent guide into installation and operational guides. Homebrew formula updated.
+
+## 2026-03-10 — /release v0.3.0
+
+- **Commit**: `f5d4b04`
+- **Outcome**: Released v0.3.0 (darwin-arm64, linux-amd64, linux-arm64). Broker runs as brew service. Homebrew formula updated with service block.
