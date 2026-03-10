@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-//go:embed agents-guide.md
+//go:embed help-agent.md
 var agentGuide string
 
 var version = "dev"
