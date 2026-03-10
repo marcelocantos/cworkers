@@ -2,10 +2,11 @@
 
 Install cworkers and configure Claude Code to use it permanently.
 
-## 1. Install
+## 1. Install and start the broker
 
 ```bash
 brew install marcelocantos/tap/cworkers
+brew services start marcelocantos/tap/cworkers
 ```
 
 ## 2. Configure Claude Code

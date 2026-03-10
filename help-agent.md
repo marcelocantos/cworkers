@@ -5,20 +5,13 @@ agents over a Unix domain socket. Workers are idle and waiting — dispatched
 tasks arrive instantly with no startup overhead. Shadow mode gives workers
 automatic awareness of your conversation context.
 
+The broker runs as a brew service — it is always available.
+
 ## Session Setup
 
 Run these steps at the start of each session.
 
-### 1. Start the broker
-
-```bash
-pgrep -f "cworkers serve" || cworkers serve &
-```
-
-The broker is global (one per user). It listens on
-`/tmp/cworkers-<uid>.sock`.
-
-### 2. Register your session transcript for shadow mode
+### 1. Register your session transcript for shadow mode
 
 Find your session's JSONL transcript file and register it:
 
@@ -31,7 +24,7 @@ UUID). Shadow mode tails the transcript and maintains a rolling window of
 recent messages. When you dispatch tasks, workers automatically receive this
 context.
 
-### 3. Spawn workers
+### 2. Spawn workers
 
 Use the Agent tool to spawn workers. Each worker is a sub-agent whose bash
 call blocks on `cworkers worker`:
@@ -51,7 +44,7 @@ The 590s timeout stays within Claude Code's 600s bash tool limit. Workers
 reconnect to the broker internally every 60 seconds, so a single call
 covers the full window.
 
-### 4. Respawn workers
+### 3. Respawn workers
 
 After a worker completes a task or times out, spawn a replacement. Keep
 the pool stocked so dispatches are served instantly.

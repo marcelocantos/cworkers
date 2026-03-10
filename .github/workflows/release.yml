@@ -55,5 +55,12 @@ jobs:
           target_linux_amd64: true
           target_linux_arm64: true
           test: 'system bin/"cworkers", "--version"'
+          formula_includes: |
+            service do
+              run [opt_bin/"cworkers", "serve"]
+              keep_alive true
+              log_path var/"log/cworkers.log"
+              error_log_path var/"log/cworkers.log"
+            end
           skip_checksum: true
           update_readme_table: true
