@@ -121,7 +121,7 @@ func main() {
 	case "unshadow":
 		unshadowCmd(sock, session)
 	case "status":
-		status(sock)
+		status(sock, session)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
 		printUsage(os.Stderr)
@@ -148,6 +148,7 @@ commands:
   unshadow   Remove a session's shadow registration
                --session <id>       Session identifier (required)
   status     Show pool size by model and shadow count
+               --session <id>       Show status for a specific session
 
 global flags:
   --sock <path>    Unix socket path (default: %s)
@@ -262,6 +263,13 @@ func (r *shadowRegistry) count() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.sessions)
+}
+
+func (r *shadowRegistry) has(sessionID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.sessions[sessionID]
+	return ok
 }
 
 func extractText(raw json.RawMessage) string {
@@ -448,6 +456,23 @@ func (p *pool) count() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.workers)
+}
+
+// countForModel returns the number of workers matching the given model.
+// If model is "", counts all workers.
+func (p *pool) countForModel(model string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if model == "" {
+		return len(p.workers)
+	}
+	n := 0
+	for _, w := range p.workers {
+		if w.model == model || w.model == "" {
+			n++
+		}
+	}
+	return n
 }
 
 func (p *pool) counts() map[string]int {
@@ -697,22 +722,48 @@ func handleConn(conn net.Conn, p *pool, reg *shadowRegistry, dispatchWait time.D
 		conn.Close()
 
 	case "STATUS":
-		var sb strings.Builder
-		counts := p.counts()
-		fmt.Fprintf(&sb, "WORKERS: %d", p.count())
-		if len(counts) > 0 {
-			fmt.Fprintf(&sb, " (")
-			first := true
-			for m, c := range counts {
-				if !first {
-					fmt.Fprintf(&sb, ", ")
-				}
-				fmt.Fprintf(&sb, "%s: %d", m, c)
-				first = false
-			}
-			fmt.Fprintf(&sb, ")")
+		sessionID := ""
+		if len(parts) > 1 {
+			sessionID = parts[1]
 		}
-		fmt.Fprintf(&sb, ", shadows: %d", reg.count())
+
+		var sb strings.Builder
+		if sessionID != "" {
+			// Session-scoped status.
+			shadowed := reg.has(sessionID)
+			matching := p.countForModel("") // all workers are potentially available
+			fmt.Fprintf(&sb, "SESSION: %s, shadow: %t, available_workers: %d", sessionID, shadowed, matching)
+			counts := p.counts()
+			if len(counts) > 0 {
+				fmt.Fprintf(&sb, " (")
+				first := true
+				for m, c := range counts {
+					if !first {
+						fmt.Fprintf(&sb, ", ")
+					}
+					fmt.Fprintf(&sb, "%s: %d", m, c)
+					first = false
+				}
+				fmt.Fprintf(&sb, ")")
+			}
+		} else {
+			// Global status.
+			counts := p.counts()
+			fmt.Fprintf(&sb, "WORKERS: %d", p.count())
+			if len(counts) > 0 {
+				fmt.Fprintf(&sb, " (")
+				first := true
+				for m, c := range counts {
+					if !first {
+						fmt.Fprintf(&sb, ", ")
+					}
+					fmt.Fprintf(&sb, "%s: %d", m, c)
+					first = false
+				}
+				fmt.Fprintf(&sb, ")")
+			}
+			fmt.Fprintf(&sb, ", shadows: %d", reg.count())
+		}
 		fmt.Fprintf(&sb, "\n")
 		fmt.Fprint(conn, sb.String())
 		conn.Close()
@@ -871,7 +922,7 @@ func unshadowCmd(sock, session string) {
 
 // --- Status ---
 
-func status(sock string) {
+func status(sock, session string) {
 	conn, err := net.Dial("unix", sock)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "status: connect: %v\n", err)
@@ -879,7 +930,11 @@ func status(sock string) {
 	}
 	defer conn.Close()
 
-	fmt.Fprintf(conn, "STATUS\n")
+	if session != "" {
+		fmt.Fprintf(conn, "STATUS %s\n", session)
+	} else {
+		fmt.Fprintf(conn, "STATUS\n")
+	}
 
 	resp, err := io.ReadAll(conn)
 	if err != nil {

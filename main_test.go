@@ -875,6 +875,85 @@ func TestE2EStatus(t *testing.T) {
 	}
 }
 
+func TestE2EStatusWithSession(t *testing.T) {
+	dir := t.TempDir()
+	txPath := filepath.Join(dir, "transcript.jsonl")
+	os.WriteFile(txPath, []byte(`{"type":"user","message":{"role":"user","content":"hello"}}
+`), 0644)
+
+	sock, _, cleanup := startTestBroker(t)
+	defer cleanup()
+
+	// Register a shadow for sess1.
+	sConn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(sConn, "SHADOW sess1 %s\n", txPath)
+	resp, _ := io.ReadAll(sConn)
+	sConn.Close()
+	if strings.TrimSpace(string(resp)) != "OK" {
+		t.Fatalf("SHADOW response: got %q", resp)
+	}
+
+	// Add an opus worker.
+	wConn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wConn.Close()
+	fmt.Fprintf(wConn, "WORKER opus\n")
+	time.Sleep(50 * time.Millisecond)
+
+	// Query session-scoped status for sess1.
+	stConn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stConn.Close()
+	fmt.Fprintf(stConn, "STATUS sess1\n")
+
+	resp, _ = io.ReadAll(stConn)
+	respStr := string(resp)
+	if !strings.Contains(respStr, "SESSION: sess1") {
+		t.Errorf("should contain session ID, got %q", respStr)
+	}
+	if !strings.Contains(respStr, "shadow: true") {
+		t.Errorf("should show shadow: true, got %q", respStr)
+	}
+	if !strings.Contains(respStr, "available_workers: 1") {
+		t.Errorf("should show available_workers: 1, got %q", respStr)
+	}
+	if !strings.Contains(respStr, "opus: 1") {
+		t.Errorf("should show opus: 1, got %q", respStr)
+	}
+}
+
+func TestE2EStatusWithSessionNoShadow(t *testing.T) {
+	sock, _, cleanup := startTestBroker(t)
+	defer cleanup()
+
+	// Query session-scoped status for a session that doesn't exist.
+	stConn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stConn.Close()
+	fmt.Fprintf(stConn, "STATUS nosuch\n")
+
+	resp, _ := io.ReadAll(stConn)
+	respStr := string(resp)
+	if !strings.Contains(respStr, "SESSION: nosuch") {
+		t.Errorf("should contain session ID, got %q", respStr)
+	}
+	if !strings.Contains(respStr, "shadow: false") {
+		t.Errorf("should show shadow: false, got %q", respStr)
+	}
+	if !strings.Contains(respStr, "available_workers: 0") {
+		t.Errorf("should show available_workers: 0, got %q", respStr)
+	}
+}
+
 func TestE2ENoWorkersTimeout(t *testing.T) {
 	// Use a very short dispatch wait to test timeout.
 	sock := tempSock(t)

@@ -107,6 +107,14 @@ cworkers status
 
 Output: `WORKERS: 3 (opus: 1, sonnet: 2), shadows: 1`
 
+For session-scoped status (is my shadow registered? are workers available?):
+
+```bash
+cworkers status --session <session-id>
+```
+
+Output: `SESSION: my-sess, shadow: true, available_workers: 3 (opus: 1, sonnet: 2)`
+
 ## Cleanup
 
 When your session ends, remove the shadow registration:
@@ -124,6 +132,6 @@ cworkers unshadow --session <session-id>
 | `dispatch` | `--model <name>`, `--session <id>` |
 | `shadow` | `--session <id>` (required), `--transcript <path>` (required), `--context <N>` (default 50) |
 | `unshadow` | `--session <id>` (required) |
-| `status` | (no flags) |
+| `status` | `--session <id>` (optional, session-scoped status) |
 
 Global: `--sock <path>` overrides the default socket path.
