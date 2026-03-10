@@ -29,7 +29,7 @@ Everything lives in a single `main.go` with `main_test.go` for tests. Key compon
 - **shadowRegistry** — Maps session IDs to shadow instances. Each shadow tails a JSONL transcript file and maintains a rolling window of recent user/assistant messages (thread-safe). Sessions register/unregister via the SHADOW/UNSHADOW protocol commands.
 - **shadow** — Tails a single transcript, maintains rolling message window. Has a `done` channel for clean shutdown on unregister.
 - **pool** — Thread-safe worker pool with model-tagged connections and a dispatch queue (waiters). When no worker matches a dispatch, the request queues with a timeout; arriving workers check queued dispatches before entering the pool.
-- **Protocol** — Line-based text over Unix socket: `WORKER <model>`, `DISPATCH <model> <session>\n<task>`, `SHADOW <session-id> <transcript-path> [context-lines]`, `UNSHADOW <session-id>`, `STATUS [session-id]`. Workers hold the connection open until a task arrives or timeout.
+- **Protocol** — Line-based text over Unix socket: `WORKER <model> <session>`, `DISPATCH <model> <session>\n<task>`, `SHADOW <session-id> <transcript-path> [context-lines]`, `UNSHADOW <session-id>`, `STATUS [session-id]`. Workers are session-scoped — the broker only routes dispatches to workers from the same session. Workers hold the connection open until a task arrives or timeout.
 - **Worker reconnect loop** — `worker` command loops internally with 60s reconnect intervals within a single bash tool call (capped at 590s default). No agent-level looping required.
 
 Socket path defaults to `/tmp/cworkers-<uid>.sock`.

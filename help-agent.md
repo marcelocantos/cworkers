@@ -65,8 +65,12 @@ Use the Agent tool to spawn workers. Each worker is a sub-agent whose bash
 call blocks on `cworkers worker`:
 
 ```bash
-cworkers worker --model opus --timeout 590s
+cworkers worker --session <session-id> --model opus --timeout 590s
 ```
+
+Workers are session-scoped: `--session` is required and must match the
+session ID used for shadow and dispatch. The broker only routes dispatches
+to workers from the same session. This prevents cross-session task leakage.
 
 The worker blocks until it receives a task, then prints it to stdout and
 exits. The sub-agent reads the task, executes it, and returns the result.
@@ -128,7 +132,7 @@ cworkers unshadow --session <session-id>
 | Command | Key Flags |
 |---|---|
 | `serve` | `--wait <dur>` (dispatch wait timeout, default 30s) |
-| `worker` | `--timeout <dur>` (lifetime, default 590s), `--model <name>` |
+| `worker` | `--session <id>` (required), `--timeout <dur>` (lifetime, default 590s), `--model <name>` |
 | `dispatch` | `--model <name>`, `--session <id>` |
 | `shadow` | `--session <id>` (required), `--transcript <path>` (required), `--context <N>` (default 50) |
 | `unshadow` | `--session <id>` (required) |
