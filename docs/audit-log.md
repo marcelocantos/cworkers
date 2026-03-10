@@ -30,3 +30,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `2c9d5da`
 - **Outcome**: Released v0.5.0 (darwin-arm64, linux-amd64, linux-arm64). Added session-scoped status query (`cworkers status --session <id>`). Reframed delegation guide to default to delegating everything.
+
+## 2026-03-11 — /release v0.6.0
+
+- **Commit**: `8c86c2d`
+- **Outcome**: Released v0.6.0 (darwin-arm64, linux-amd64, linux-arm64). Fixed Homebrew version detection (was showing "64" instead of semver) by adding explicit `version` input to homebrew-releaser workflow.
