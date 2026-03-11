@@ -16,7 +16,8 @@ brew services start marcelocantos/tap/cworkers
    cworkers --help-agent > ~/.claude/cworkers-guide.md
    ```
 
-2. Add a reference to `~/.claude/CLAUDE.md`:
+2. Add a reference **near the top** of `~/.claude/CLAUDE.md` (before
+   other directives, so it's read first):
    ```markdown
    ## cworkers — Task Delegation
 

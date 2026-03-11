@@ -39,18 +39,34 @@ a command, ask yourself: can a worker do this instead? Usually yes.
 When in doubt, use sonnet. Reserve opus for tasks that genuinely need
 deeper reasoning.
 
+Examples:
+- **opus**: designing a new module's API, debugging a subtle race
+  condition, reviewing architecture trade-offs, writing a complex
+  algorithm from scratch.
+- **sonnet**: implementing a function from a spec, running tests and
+  reporting results, applying a pattern across files, reading code
+  and summarising findings.
+
 ## Session Setup
 
 At the start of each session, register your transcript for shadow mode:
 
 ```bash
-cworkers shadow --session <session-id> --transcript <path-to-transcript.jsonl>
+SESSION_ID=$(cworkers shadow)
 ```
 
-Use a unique session identifier (e.g., your working directory basename or a
-UUID). Shadow mode tails the transcript and maintains a rolling window of
-recent messages. When you dispatch tasks, workers automatically receive this
-context.
+This auto-discovers your transcript (by finding the most recently modified
+JSONL in your Claude Code project directory) and prints a session ID. Use
+`$SESSION_ID` for all subsequent `dispatch`, `worker`, `status`, and
+`unshadow` calls.
+
+Shadow mode tails the transcript and maintains a rolling window of recent
+messages. When you dispatch tasks, workers automatically receive this context.
+
+If auto-discovery fails (e.g., non-standard setup), use explicit flags:
+```bash
+cworkers shadow --session <id> --transcript <path>
+```
 
 **Always decide to delegate as if a worker is available.** Don't check
 pool status before deciding *whether* to delegate — only check it to

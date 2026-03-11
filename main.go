@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -147,8 +148,9 @@ commands:
                --model <name>       Route to a specific model worker
                --session <id>       Use shadow context from this session
   shadow     Register a session transcript for context injection
-               --session <id>       Session identifier (required)
-               --transcript <path>  JSONL transcript to shadow (required)
+               (no flags)           Auto-discover transcript from cwd; prints session ID
+               --session <id>       Session identifier (explicit override)
+               --transcript <path>  JSONL transcript to shadow (explicit override)
                --context <N>        Number of recent messages to keep (default: 50)
   unshadow   Remove a session's shadow registration
                --session <id>       Session identifier (required)
@@ -898,13 +900,68 @@ func dispatch(sock, task, model, session string) {
 
 // --- Shadow / Unshadow CLI ---
 
-func shadowCmd(sock, session, transcript string, contextLines int) {
-	if session == "" {
-		fmt.Fprintln(os.Stderr, "shadow: --session is required")
-		os.Exit(1)
+// discoverTranscript finds the most recently modified .jsonl file in
+// the Claude Code project directory for the current working directory.
+// Returns the transcript path and a session ID derived from its filename.
+func discoverTranscript() (transcript, sessionID string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", fmt.Errorf("home dir: %w", err)
 	}
-	if transcript == "" {
-		fmt.Fprintln(os.Stderr, "shadow: --transcript is required")
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", "", fmt.Errorf("getwd: %w", err)
+	}
+
+	// Claude Code encodes the cwd by replacing "/" with "-" and prepending "-".
+	encoded := "-" + strings.ReplaceAll(cwd[1:], "/", "-")
+	projectDir := filepath.Join(home, ".claude", "projects", encoded)
+
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		return "", "", fmt.Errorf("read project dir %s: %w", projectDir, err)
+	}
+
+	var newest string
+	var newestTime time.Time
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(newestTime) {
+			newestTime = info.ModTime()
+			newest = e.Name()
+		}
+	}
+
+	if newest == "" {
+		return "", "", fmt.Errorf("no .jsonl transcripts found in %s", projectDir)
+	}
+
+	transcript = filepath.Join(projectDir, newest)
+	sessionID = strings.TrimSuffix(newest, ".jsonl")
+	return transcript, sessionID, nil
+}
+
+func shadowCmd(sock, session, transcript string, contextLines int) {
+	// Auto-discover transcript and session if not provided.
+	if session == "" && transcript == "" {
+		var err error
+		transcript, session, err = discoverTranscript()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "shadow: auto-discover: %v\n", err)
+			os.Exit(1)
+		}
+	} else if session == "" {
+		fmt.Fprintln(os.Stderr, "shadow: --session is required (or omit both --session and --transcript for auto-discovery)")
+		os.Exit(1)
+	} else if transcript == "" {
+		fmt.Fprintln(os.Stderr, "shadow: --transcript is required (or omit both --session and --transcript for auto-discovery)")
 		os.Exit(1)
 	}
 
@@ -926,7 +983,14 @@ func shadowCmd(sock, session, transcript string, contextLines int) {
 		fmt.Fprintf(os.Stderr, "shadow: read: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Print(string(resp))
+
+	trimmed := strings.TrimSpace(string(resp))
+	if strings.HasPrefix(trimmed, "OK") {
+		// Print session ID so the agent can capture it.
+		fmt.Println(session)
+	} else {
+		fmt.Print(string(resp))
+	}
 }
 
 func unshadowCmd(sock, session string) {

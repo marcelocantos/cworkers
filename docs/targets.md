@@ -28,6 +28,19 @@
 - **Status**: identified
 - **Discovered**: 2026-03-11
 
+### 🎯T5 Session setup is a single command with auto-discovery
+- **Weight**: 4 (value 8 / cost 2)
+- **Estimated-cost**: 2
+- **Acceptance**:
+  - `cworkers shadow` (no `--session` or `--transcript` args) auto-discovers the transcript by finding the most recently modified JSONL in `~/.claude/projects/<encoded-cwd>/`
+  - Session ID is derived from the transcript path and printed to stdout
+  - The agent uses the printed session ID for all subsequent dispatch/status/unshadow calls
+  - `--session` and `--transcript` flags still work as explicit overrides
+  - All other subcommands (`dispatch`, `worker`, `status`, `unshadow`) continue to require `--session`
+- **Context**: Agents cannot reliably discover their own transcript path or session ID. The current setup requires the agent to somehow know both, which is fragile. Auto-discovery using cwd-scoped directory + most-recent-file heuristic eliminates this friction. The race window (two sessions in the same project dir calling shadow at the same instant) is acceptably narrow.
+- **Status**: converging
+- **Discovered**: 2026-03-11
+
 ## Achieved
 
 ### 🎯T1 cworkers is published as open-source on GitHub

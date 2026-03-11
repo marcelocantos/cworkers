@@ -1184,6 +1184,68 @@ func TestE2ESessionIsolation(t *testing.T) {
 	}
 }
 
+// --- discoverTranscript ---
+
+func TestDiscoverTranscriptFindsNewest(t *testing.T) {
+	// Create a fake Claude Code project directory structure.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Simulate cwd encoding: /foo/bar -> -foo-bar
+	origDir, _ := os.Getwd()
+	encoded := "-" + strings.ReplaceAll(origDir[1:], "/", "-")
+	projectDir := filepath.Join(home, ".claude", "projects", encoded)
+	os.MkdirAll(projectDir, 0755)
+
+	// Create two transcript files with different timestamps.
+	oldFile := filepath.Join(projectDir, "old-session.jsonl")
+	newFile := filepath.Join(projectDir, "new-session.jsonl")
+
+	os.WriteFile(oldFile, []byte(`{"type":"user"}`), 0644)
+	// Backdate the old file.
+	oldTime := time.Now().Add(-1 * time.Hour)
+	os.Chtimes(oldFile, oldTime, oldTime)
+
+	os.WriteFile(newFile, []byte(`{"type":"user"}`), 0644)
+
+	transcript, sessionID, err := discoverTranscript()
+	if err != nil {
+		t.Fatalf("discoverTranscript: %v", err)
+	}
+
+	if transcript != newFile {
+		t.Errorf("should find newest file, got %s, want %s", transcript, newFile)
+	}
+	if sessionID != "new-session" {
+		t.Errorf("session ID should be 'new-session', got %q", sessionID)
+	}
+}
+
+func TestDiscoverTranscriptNoFiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	origDir, _ := os.Getwd()
+	encoded := "-" + strings.ReplaceAll(origDir[1:], "/", "-")
+	projectDir := filepath.Join(home, ".claude", "projects", encoded)
+	os.MkdirAll(projectDir, 0755)
+
+	_, _, err := discoverTranscript()
+	if err == nil {
+		t.Fatal("should error when no transcripts found")
+	}
+}
+
+func TestDiscoverTranscriptNoProjectDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	_, _, err := discoverTranscript()
+	if err == nil {
+		t.Fatal("should error when project dir doesn't exist")
+	}
+}
+
 // --- Pool drain ---
 
 func TestPoolDrain(t *testing.T) {
