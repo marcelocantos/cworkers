@@ -18,98 +18,74 @@ session is doing without the root paying the token cost of inline work.
 ```
  Root Agent Session
    |
-   |  (spawns at session start)
+   |  MCP tool call: cwork(task, cwd, model?)
    |
-   +---> cworkers serve                # broker process (global, one per user)
-   |       - Unix socket listener
-   |       - shadow registry (per-session transcripts)
-   |       - worker pool + dispatch queue
+   +---> cworkers serve --port 4242     # MCP broker daemon (global, one per user)
+   |       - Streamable HTTP on /mcp
+   |       - Shadow registry (per-cwd, auto-discovered transcripts)
+   |       - Worker pool (pre-spawned claude -p processes)
+   |       - HTTP status endpoint on /status
    |
-   +---> cworkers shadow --session S1 --transcript /path/to/session.jsonl
+   |  (on first cwork call for a cwd)
+   |     -> auto-discovers transcript: ~/.claude/projects/<encoded-cwd>/*.jsonl
+   |     -> registers shadow, begins tailing
    |
-   +---> agent: cworkers worker --model opus    # pre-spawned workers
-   +---> agent: cworkers worker --model opus    #   (idle, waiting)
-   +---> agent: cworkers worker --model sonnet
-   +---> agent: cworkers worker --model sonnet
-   |
-   |  (when root needs to delegate)
-   |
-   +---> cworkers dispatch --session S1 --model opus "Analyze the code in src/"
-            -> broker looks up session S1's shadow
-            -> broker matches to pooled opus worker
-            -> worker receives task + session S1's conversation context
-            -> worker executes, returns result to root via tool output
+   |  (on each dispatch)
+   |     -> takes idle worker from pool (or spawns cold)
+   |     -> injects shadow context + task into worker's stdin
+   |     -> spawns replacement worker in background (pre-warming)
+   |     -> sends progress heartbeats every 20s
+   |     -> returns worker's result as MCP tool response
 ```
 
-The entire system is a single Go binary (zero dependencies) with six
-subcommands: `serve`, `worker`, `dispatch`, `shadow`, `unshadow`, `status`.
+The system is a single Go binary with two subcommands: `serve` (MCP daemon)
+and `status` (pool/shadow query). Workers are `claude -p` processes managed
+by the broker — not a cworkers subcommand.
 
-## Protocol
+## MCP Interface
 
-All communication uses a line-based text protocol over a Unix domain socket
-(`/tmp/cworkers-<uid>.sock` by default).
-
-### Worker Registration
+### Tool: cwork
 
 ```
-Client: WORKER <model> <session>\n
-Server: (connection held open until task arrives or timeout)
-Server: <context>\n\nTASK: <task body>   (on dispatch)
-Server: (connection closed cleanly on timeout)
+cwork(task: string, cwd: string, model?: string) → string
 ```
 
-Workers are session-scoped: the broker only routes dispatches to workers
-from the same session. Both `<model>` and `<session>` are positional and
-can be empty (empty = wildcard).
+- **task**: The prompt to send to the worker.
+- **cwd**: Working directory of the calling session. Used for shadow lookup
+  and worker process working directory.
+- **model**: Model for the worker (default: "sonnet"). Options: sonnet, opus.
 
-### Task Dispatch
+The broker:
+1. Auto-registers a shadow for the cwd if one doesn't exist (discovers
+   transcript from `~/.claude/projects/<encoded-cwd>/`).
+2. Takes an idle worker from the pool, or spawns one cold.
+3. Spawns a replacement worker in the background (pre-warming).
+4. Injects shadow context + task into the worker's stdin.
+5. Sends progress heartbeats every 20s to prevent MCP client timeout.
+6. Returns the worker's result text.
 
-```
-Client: DISPATCH <model> <session>\n<task body>
-Client: (half-close write side)
-Server: OK\n          (task delivered)
-Server: NO_WORKERS\n  (no matching worker within wait period)
-```
+On first use for a cwd, appends a setup hint suggesting the CLAUDE.md
+directive to ensure agents always delegate.
 
-The `<model>` and `<session>` fields are space-separated. Either can be empty
-(empty = no filtering / no context injection).
-
-### Shadow Registration
-
-```
-Client: SHADOW <session-id> <transcript-path> [context-lines]\n
-Server: OK\n
-```
-
-Registers a session's JSONL transcript for tailing. `context-lines` defaults
-to 50. If the session already has a shadow, the old one is replaced.
-
-### Shadow Removal
+### Status Endpoint
 
 ```
-Client: UNSHADOW <session-id>\n
-Server: OK\n
+GET /status → { "workers": N, "models": {...}, "shadows": N }
 ```
 
-Stops tailing and removes the session's shadow.
-
-### Status Query
-
-```
-Client: STATUS\n
-Server: WORKERS: 4 (opus: 2, sonnet: 2), shadows: 2\n
-```
+Also available via CLI: `cworkers status [--port N]`.
 
 ## Shadow Mode
 
-Sessions register their transcripts dynamically via the `SHADOW` command
-(or the `cworkers shadow` CLI subcommand). The broker maintains a
-`shadowRegistry` mapping session IDs to shadow instances, each tailing its
-own JSONL transcript file with a rolling window of recent user/assistant
-messages (default 50, configurable per-session).
+Shadows are registered implicitly on first `cwork` call per working
+directory. The broker discovers the most recently modified `.jsonl`
+transcript in `~/.claude/projects/<encoded-cwd>/` and begins tailing it.
 
-When dispatching a task with a session ID, the broker looks up that session's
-shadow and prepends the context:
+The `shadowRegistry` maps cwds to shadow instances. Each shadow tails its
+JSONL transcript with a rolling window of recent user/assistant messages
+(default 50 lines). Thread-safe with double-checked locking on registration.
+
+When dispatching, the broker prepends shadow context:
 
 ```
 === CONVERSATION CONTEXT (recent messages from root session) ===
@@ -120,67 +96,71 @@ shadow and prepends the context:
 TASK: <the actual task>
 ```
 
-This gives workers awareness of the root conversation — what was discussed,
-what decisions were made, what the user cares about — without the root agent
-needing to summarize or repeat anything.
+This gives workers awareness of the root conversation without the root
+agent needing to summarize or repeat anything.
 
-The tailer uses manual byte-offset tracking (not `Seek`-based) to avoid a
-partial-line duplication bug identified during architecture review. Incomplete
-lines are buffered across reads. Each shadow has a `done` channel; closing it
-(via `UNSHADOW` or re-registration) cleanly stops the tailer goroutine.
+### Transcript Discovery
+
+The encoded cwd path replaces `/` and `.` with `-` and prepends `-`,
+matching Claude Code's project directory naming convention. The broker
+scans for `.jsonl` files and selects the most recently modified one.
+
+## Worker Processes
+
+Workers are `claude -p --verbose --output-format stream-json
+--dangerously-skip-permissions` processes. They are spawned by the broker
+(not by the user or root agent) and managed as a pool keyed by
+`cwd + model`.
+
+### Pre-warming
+
+After each dispatch, the broker spawns a replacement worker in the
+background. This ensures the next dispatch finds an idle worker ready —
+no startup delay. The pool is demand-driven: workers are only spawned
+for cwd/model combinations that have been used.
+
+### NDJSON Output Parsing
+
+Workers produce stream-json output. The broker parses NDJSON lines looking
+for:
+- `"type": "assistant"` messages — accumulated as text parts.
+- `"type": "result"` with `"subtype": "success"` — the final result text.
+- `"type": "result"` with errors — reported as tool errors.
+
+If a `result` line is found, its text is returned. Otherwise, accumulated
+assistant text parts are joined and returned.
 
 ## Model Routing
 
-Workers register with a model tag (e.g., `opus`, `sonnet`). Dispatches can
-request a specific model via `--model`. The broker matches by exact string
-equality; an empty model on either side acts as a wildcard.
+Workers register with a model tag. The pool is keyed by `cwd + "\x00" +
+model`. Dispatches request a specific model; the broker matches exactly.
+Default model is "sonnet".
 
-This enables the root to maintain a mixed pool and route tasks by complexity:
-opus for deep reasoning, sonnet for structured/mechanical work.
+This enables routing tasks by complexity: opus for deep reasoning, sonnet
+for structured/mechanical work.
 
-## Dispatch Queue
+## Progress Heartbeats
 
-If no matching worker is available at dispatch time, the broker does not fail
-immediately. Instead, it queues the dispatch request and waits (default 30s,
-configurable via `--wait`) for a worker to register. When a matching worker
-connects, the broker delivers the queued task directly — the worker never
-enters the pool.
-
-This eliminates the race condition where a replacement worker is still
-spawning when a new task arrives.
-
-## Worker Reconnect Loop
-
-The worker binary loops internally with a 60-second reconnect interval,
-staying within a single bash tool call (max 600s). On each iteration it
-connects to the broker, registers, and waits up to 60s for a task. If none
-arrives, it disconnects and reconnects — keeping connections short-lived
-(which also prevents ghost workers). The agent sees nothing during this
-cycling; it either gets a task printed to stdout or the process exits cleanly.
+Long-running dispatches send `notifications/progress` and
+`notifications/message` every 20 seconds via the MCP server context.
+This prevents MCP client timeouts during extended worker operations.
 
 ## Known Limitations
 
-- **600s hard ceiling**: The bash tool timeout caps worker lifetime at ~10
-  minutes. Workers must be respawned by the root agent after expiry.
-
-- **Socket path is per-user, not per-session**: `/tmp/cworkers-<uid>.sock`
-  avoids collisions between users but not between concurrent sessions of the
-  same user. Use `--sock` to disambiguate if needed (though multi-session
-  shadow mode means a single broker can serve all sessions).
-
-- **No task acknowledgment**: Once the broker writes a task to a worker
-  connection, it considers the task delivered. If the worker crashes mid-
+- **No task acknowledgment**: Once the broker writes a prompt to a worker's
+  stdin, it considers the task delivered. If the worker crashes mid-
   execution, the task is lost — there is no retry or dead-letter mechanism.
-
-- **Stale worker detection is reactive**: The broker discovers dead workers
-  only when attempting to write a task to them. The 60s reconnect interval
-  bounds staleness but does not eliminate it.
 
 - **Shadow consistency**: Two dispatches close together may receive slightly
   different context snapshots, since the tailer runs asynchronously. This
   is acceptable for the use case (conversational awareness, not
   transactional consistency).
 
-- **Transcript discovery is manual**: The root agent must know and pass the
-  transcript file path. There is no automatic discovery of the active
-  session's JSONL file.
+- **Single-transcript-per-cwd**: If two Claude Code sessions run in the
+  same project directory simultaneously, only the most recently modified
+  transcript is tailed. The race window is acceptably narrow for normal use.
+
+- **Port-based, not socket-based**: The MCP server uses HTTP (default port
+  4242). Unlike the previous Unix socket design, this is accessible from
+  any process on localhost but does not provide per-user isolation.
+  Multiple users on the same host need different ports.

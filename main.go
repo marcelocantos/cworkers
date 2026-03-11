@@ -5,13 +5,15 @@ package main
 
 import (
 	"bufio"
+	"context"
 	_ "embed"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"net"
+	"log"
+	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -19,6 +21,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
 
 //go:embed help-agent.md
@@ -26,24 +31,12 @@ var agentGuide string
 
 var version = "dev"
 
-func defaultSockPath() string {
-	return fmt.Sprintf("/tmp/cworkers-%d.sock", os.Getuid())
-}
-
-// maxPayload is the maximum size of a dispatch task payload (10 MB).
-const maxPayload = 10 << 20
+const defaultPort = 4242
 
 func main() {
 	args := os.Args[1:]
-	sock := defaultSockPath()
-	var timeout time.Duration
-	var model string
-	var session string
-	var transcript string
-	var contextLines int
-	var dispatchWait time.Duration
+	port := defaultPort
 
-	// Parse flags.
 	for i := 0; i < len(args); {
 		switch {
 		case args[i] == "--version":
@@ -57,41 +50,13 @@ func main() {
 			fmt.Println()
 			fmt.Print(agentGuide)
 			return
-		case args[i] == "--sock" && i+1 < len(args):
-			sock = args[i+1]
-			args = append(args[:i], args[i+2:]...)
-		case args[i] == "--timeout" && i+1 < len(args):
-			var err error
-			timeout, err = time.ParseDuration(args[i+1])
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "bad --timeout: %v\n", err)
-				os.Exit(1)
-			}
-			args = append(args[:i], args[i+2:]...)
-		case args[i] == "--model" && i+1 < len(args):
-			model = args[i+1]
-			args = append(args[:i], args[i+2:]...)
-		case args[i] == "--session" && i+1 < len(args):
-			session = args[i+1]
-			args = append(args[:i], args[i+2:]...)
-		case args[i] == "--transcript" && i+1 < len(args):
-			transcript = args[i+1]
-			args = append(args[:i], args[i+2:]...)
-		case args[i] == "--context" && i+1 < len(args):
+		case args[i] == "--port" && i+1 < len(args):
 			n, err := strconv.Atoi(args[i+1])
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "bad --context: %v\n", err)
+				fmt.Fprintf(os.Stderr, "bad --port: %v\n", err)
 				os.Exit(1)
 			}
-			contextLines = n
-			args = append(args[:i], args[i+2:]...)
-		case args[i] == "--wait" && i+1 < len(args):
-			var err error
-			dispatchWait, err = time.ParseDuration(args[i+1])
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "bad --wait: %v\n", err)
-				os.Exit(1)
-			}
+			port = n
 			args = append(args[:i], args[i+2:]...)
 		case strings.HasPrefix(args[i], "-"):
 			fmt.Fprintf(os.Stderr, "unknown flag: %s\n", args[i])
@@ -108,25 +73,9 @@ func main() {
 
 	switch args[0] {
 	case "serve":
-		serve(sock, dispatchWait)
-	case "worker":
-		if session == "" {
-			fmt.Fprintln(os.Stderr, "worker: --session is required")
-			os.Exit(1)
-		}
-		worker(sock, timeout, model, session)
-	case "dispatch":
-		if len(args) < 2 {
-			fmt.Fprintln(os.Stderr, "usage: cworkers dispatch <task>")
-			os.Exit(1)
-		}
-		dispatch(sock, strings.Join(args[1:], " "), model, session)
-	case "shadow":
-		shadowCmd(sock, session, transcript, contextLines)
-	case "unshadow":
-		unshadowCmd(sock, session)
+		serve(port)
 	case "status":
-		status(sock, session)
+		statusCmd(port)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
 		printUsage(os.Stderr)
@@ -138,31 +87,16 @@ func printUsage(w io.Writer) {
 	fmt.Fprintf(w, `usage: cworkers <command> [flags]
 
 commands:
-  serve      Start the broker
-               --wait <dur>         Max time to wait for a worker on dispatch (default: 30s)
-  worker     Block until a task arrives, print it
-               --session <id>       Session to bind to (required)
-               --timeout <dur>      Total lifetime before exit (e.g. 590s)
-               --model <name>       Register as a specific model (e.g. opus, sonnet)
-  dispatch   Send a task to an available worker
-               --model <name>       Route to a specific model worker
-               --session <id>       Use shadow context from this session
-  shadow     Register a session transcript for context injection
-               (no flags)           Auto-discover transcript from cwd; prints session ID
-               --session <id>       Session identifier (explicit override)
-               --transcript <path>  JSONL transcript to shadow (explicit override)
-               --context <N>        Number of recent messages to keep (default: 50)
-  unshadow   Remove a session's shadow registration
-               --session <id>       Session identifier (required)
-  status     Show pool size by model and shadow count
-               --session <id>       Show status for a specific session
+  serve      Start the MCP broker daemon
+               --port <N>    HTTP port (default: %d)
+  status     Show pool and shadow state
 
 global flags:
-  --sock <path>    Unix socket path (default: %s)
-  --version        Print version and exit
-  --help           Show this help
-  --help-agent     Show help plus agent integration guide
-`, defaultSockPath())
+  --port <N>     HTTP port (default: %d)
+  --version      Print version and exit
+  --help         Show this help
+  --help-agent   Show help plus agent integration guide
+`, defaultPort, defaultPort)
 }
 
 // --- Transcript shadow ---
@@ -184,15 +118,18 @@ type shadow struct {
 	messages []string
 	maxLines int
 	done     chan struct{}
+	cwd      string
+	first    sync.Once
 }
 
-func newShadow(maxLines int) *shadow {
+func newShadow(cwd string, maxLines int) *shadow {
 	if maxLines <= 0 {
 		maxLines = 50
 	}
 	return &shadow{
 		maxLines: maxLines,
 		done:     make(chan struct{}),
+		cwd:      cwd,
 	}
 }
 
@@ -217,7 +154,6 @@ func (s *shadow) snapshot() string {
 func (s *shadow) stop() {
 	select {
 	case <-s.done:
-		// Already closed.
 	default:
 		close(s.done)
 	}
@@ -226,57 +162,49 @@ func (s *shadow) stop() {
 // --- Shadow Registry ---
 
 type shadowRegistry struct {
-	mu       sync.RWMutex
-	sessions map[string]*shadow // session-id → shadow
+	mu      sync.RWMutex
+	shadows map[string]*shadow // cwd → shadow
 }
 
 func newShadowRegistry() *shadowRegistry {
 	return &shadowRegistry{
-		sessions: make(map[string]*shadow),
+		shadows: make(map[string]*shadow),
 	}
 }
 
-func (r *shadowRegistry) register(sessionID, transcriptPath string, contextLines int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// If there's an existing shadow for this session, stop it first.
-	if old, ok := r.sessions[sessionID]; ok {
-		old.stop()
-	}
-
-	s := newShadow(contextLines)
-	r.sessions[sessionID] = s
-	go tailTranscript(transcriptPath, s)
-}
-
-func (r *shadowRegistry) unregister(sessionID string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if s, ok := r.sessions[sessionID]; ok {
-		s.stop()
-		delete(r.sessions, sessionID)
-	}
-}
-
-func (r *shadowRegistry) get(sessionID string) *shadow {
+// getOrCreate returns an existing shadow for the cwd, or discovers the
+// transcript and registers a new one. Thread-safe.
+func (r *shadowRegistry) getOrCreate(cwd string) (*shadow, error) {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.sessions[sessionID]
+	s, ok := r.shadows[cwd]
+	r.mu.RUnlock()
+	if ok {
+		return s, nil
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Double-check after acquiring write lock.
+	if s, ok := r.shadows[cwd]; ok {
+		return s, nil
+	}
+
+	transcript, err := discoverTranscript(cwd)
+	if err != nil {
+		return nil, err
+	}
+
+	s = newShadow(cwd, 50)
+	r.shadows[cwd] = s
+	go tailTranscript(transcript, s)
+	log.Printf("shadow registered cwd=%s transcript=%s", cwd, filepath.Base(transcript))
+	return s, nil
 }
 
 func (r *shadowRegistry) count() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return len(r.sessions)
-}
-
-func (r *shadowRegistry) has(sessionID string) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	_, ok := r.sessions[sessionID]
-	return ok
+	return len(r.shadows)
 }
 
 func extractText(raw json.RawMessage) string {
@@ -303,20 +231,17 @@ func extractText(raw json.RawMessage) string {
 }
 
 // tailTranscript reads a JSONL file and tails it for new lines.
-// Tracks byte offset manually to avoid the partial-read duplication
-// bug identified in the architecture review.
 func tailTranscript(path string, s *shadow) {
 	f, err := os.Open(path)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "broker: shadow: open %s: %v\n", path, err)
+		log.Printf("shadow: open %s: %v", path, err)
 		return
 	}
 	defer f.Close()
 
-	fmt.Fprintf(os.Stderr, "broker: shadowing %s\n", path)
+	log.Printf("shadowing %s", path)
 
 	scanner := bufio.NewScanner(f)
-	// Allow lines up to 10MB (transcript entries can be large).
 	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 
 	for {
@@ -324,10 +249,9 @@ func tailTranscript(path string, s *shadow) {
 			processLine(scanner.Bytes(), s)
 		}
 		if err := scanner.Err(); err != nil {
-			fmt.Fprintf(os.Stderr, "broker: shadow: scan: %v\n", err)
+			log.Printf("shadow: scan: %v", err)
 			return
 		}
-		// EOF — wait for more data and reset the scanner on the same file handle.
 		select {
 		case <-s.done:
 			return
@@ -369,128 +293,243 @@ func processLine(line []byte, s *shadow) {
 	s.add(fmt.Sprintf("[%s]: %s", role, text))
 }
 
+// --- Worker Process ---
+
+// workerProc represents a pre-spawned claude -p process waiting for
+// a prompt on stdin.
+type workerProc struct {
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout io.ReadCloser
+	cwd    string
+	model  string
+	cancel context.CancelFunc
+}
+
+// spawnFunc is the function used to create workers. Replaced in tests.
+var spawnFunc = spawnWorker
+
+// spawnWorker starts a claude -p process ready to receive a prompt on stdin.
+// The process initialises while stdin is held open; when a task arrives
+// the broker writes the prompt and closes stdin to trigger execution.
+func spawnWorker(cwd, model string) (*workerProc, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	args := []string{
+		"-p",
+		"--verbose",
+		"--output-format", "stream-json",
+		"--dangerously-skip-permissions",
+	}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+
+	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd.Dir = cwd
+	// Unset CLAUDECODE to avoid nested session detection.
+	cmd.Env = filterEnv(os.Environ(), "CLAUDECODE")
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("stdin pipe: %w", err)
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("start claude: %w", err)
+	}
+
+	// Drain stderr in a goroutine to avoid blocking.
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		scanner.Buffer(make([]byte, 256*1024), 256*1024)
+		for scanner.Scan() {
+			log.Printf("claude stderr [%s]: %s", model, scanner.Text())
+		}
+	}()
+
+	return &workerProc{
+		cmd:    cmd,
+		stdin:  stdin,
+		stdout: stdout,
+		cwd:    cwd,
+		model:  model,
+		cancel: cancel,
+	}, nil
+}
+
+// dispatch sends a prompt to the worker and blocks until it returns a result.
+func (w *workerProc) dispatch(prompt string) (string, error) {
+	// Write prompt and close stdin to signal EOF.
+	if _, err := io.WriteString(w.stdin, prompt); err != nil {
+		w.cancel()
+		return "", fmt.Errorf("write prompt: %w", err)
+	}
+	w.stdin.Close()
+
+	// Parse NDJSON output from stdout.
+	scanner := bufio.NewScanner(w.stdout)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	var resultText string
+	var textParts []string
+	var errMsg string
+	var lineCount int
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		lineCount++
+
+		var base struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(line, &base) != nil {
+			log.Printf("worker [%s]: unparseable line: %.100s", w.model, line)
+			continue
+		}
+
+		switch base.Type {
+		case "assistant":
+			var msg struct {
+				Message struct {
+					Content []struct {
+						Type string `json:"type"`
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"message"`
+			}
+			if json.Unmarshal(line, &msg) == nil {
+				for _, b := range msg.Message.Content {
+					if b.Type == "text" && b.Text != "" {
+						textParts = append(textParts, b.Text)
+					}
+				}
+			}
+		case "result":
+			var res struct {
+				Subtype string `json:"subtype"`
+				Result  string `json:"result"`
+				Errors  []struct {
+					Message string `json:"message"`
+				} `json:"errors"`
+			}
+			if json.Unmarshal(line, &res) == nil {
+				if res.Subtype == "success" {
+					resultText = res.Result
+				} else {
+					var msgs []string
+					for _, e := range res.Errors {
+						msgs = append(msgs, e.Message)
+					}
+					errMsg = strings.Join(msgs, "; ")
+				}
+			}
+		}
+	}
+
+	// Wait for process to exit.
+	waitErr := w.cmd.Wait()
+
+	log.Printf("worker [%s]: done, %d NDJSON lines, result=%d bytes, textParts=%d, err=%q, waitErr=%v",
+		w.model, lineCount, len(resultText), len(textParts), errMsg, waitErr)
+
+	if resultText != "" {
+		return resultText, nil
+	}
+	if len(textParts) > 0 {
+		return strings.Join(textParts, ""), nil
+	}
+	if errMsg != "" {
+		return "", fmt.Errorf("claude error: %s", errMsg)
+	}
+	if waitErr != nil {
+		return "", fmt.Errorf("claude exited: %w", waitErr)
+	}
+	return "Worker finished (no result text).", nil
+}
+
+func (w *workerProc) kill() {
+	if w.cancel != nil {
+		w.cancel()
+	}
+}
+
 // --- Pool ---
 
-type taggedWorker struct {
-	conn    net.Conn
-	model   string
-	session string
-}
-
 type pool struct {
-	mu      sync.Mutex
-	workers []taggedWorker
-	// waiters holds dispatch requests waiting for a worker.
-	waiters []dispatchWaiter
+	mu   sync.Mutex
+	idle map[string][]*workerProc // key: cwd + "\x00" + model
 }
 
-type dispatchWaiter struct {
-	model   string
-	session string
-	ch      chan net.Conn
-	expires time.Time
+func newPool() *pool {
+	return &pool{
+		idle: make(map[string][]*workerProc),
+	}
 }
 
-func (p *pool) add(conn net.Conn, model, session string) {
+func poolKey(cwd, model string) string {
+	return cwd + "\x00" + model
+}
+
+func (p *pool) take(cwd, model string) *workerProc {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	// Compact expired waiters and find a match in one pass.
-	now := time.Now()
-	n := 0
-	matched := -1
-	for i, w := range p.waiters {
-		if now.After(w.expires) {
-			continue // drop expired
-		}
-		if matched < 0 && w.session == session && (w.model == "" || w.model == model) {
-			matched = n
-		}
-		p.waiters[n] = p.waiters[i]
-		n++
+	key := poolKey(cwd, model)
+	workers := p.idle[key]
+	if len(workers) == 0 {
+		return nil
 	}
-	p.waiters = p.waiters[:n]
-
-	if matched >= 0 {
-		w := p.waiters[matched]
-		p.waiters = append(p.waiters[:matched], p.waiters[matched+1:]...)
-		w.ch <- conn
-		return
+	w := workers[len(workers)-1]
+	p.idle[key] = workers[:len(workers)-1]
+	if len(p.idle[key]) == 0 {
+		delete(p.idle, key)
 	}
-
-	p.workers = append(p.workers, taggedWorker{conn: conn, model: model, session: session})
+	return w
 }
 
-// take returns the first worker matching the requested model and session.
-// If model is "", any model matches. Session must always match exactly.
-func (p *pool) take(model, session string) net.Conn {
+func (p *pool) put(w *workerProc) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for i, w := range p.workers {
-		if w.session == session && (model == "" || w.model == model) {
-			p.workers = append(p.workers[:i], p.workers[i+1:]...)
-			return w.conn
-		}
-	}
-	return nil
-}
-
-// wait registers a dispatch waiter and returns a channel that will
-// receive a worker connection when one becomes available.
-func (p *pool) wait(model, session string, deadline time.Time) chan net.Conn {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	ch := make(chan net.Conn, 1)
-	p.waiters = append(p.waiters, dispatchWaiter{
-		model:   model,
-		session: session,
-		ch:      ch,
-		expires: deadline,
-	})
-	return ch
-}
-
-// removeWaiter removes a waiter's channel (on timeout).
-func (p *pool) removeWaiter(ch chan net.Conn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for i, w := range p.waiters {
-		if w.ch == ch {
-			p.waiters = append(p.waiters[:i], p.waiters[i+1:]...)
-			return
-		}
-	}
+	key := poolKey(w.cwd, w.model)
+	p.idle[key] = append(p.idle[key], w)
 }
 
 func (p *pool) count() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.workers)
-}
-
-// countForSession returns the number of workers for a given session.
-func (p *pool) countForSession(session string) int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	n := 0
-	for _, w := range p.workers {
-		if w.session == session {
-			n++
-		}
+	for _, ws := range p.idle {
+		n += len(ws)
 	}
 	return n
 }
 
-// countsForSession returns per-model worker counts for a given session.
-func (p *pool) countsForSession(session string) map[string]int {
+func (p *pool) counts() map[string]int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	m := make(map[string]int)
-	for _, w := range p.workers {
-		if w.session == session {
+	for _, ws := range p.idle {
+		for _, w := range ws {
 			model := w.model
 			if model == "" {
-				model = "any"
+				model = "default"
 			}
 			m[model]++
 		}
@@ -498,429 +537,34 @@ func (p *pool) countsForSession(session string) map[string]int {
 	return m
 }
 
-func (p *pool) counts() map[string]int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	m := make(map[string]int)
-	for _, w := range p.workers {
-		model := w.model
-		if model == "" {
-			model = "any"
-		}
-		m[model]++
-	}
-	return m
-}
-
-// drain closes all pooled worker connections and cancels all pending waiters.
 func (p *pool) drain() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, w := range p.workers {
-		w.conn.Close()
-	}
-	p.workers = nil
-	for _, w := range p.waiters {
-		close(w.ch)
-	}
-	p.waiters = nil
-}
-
-// --- Serve ---
-
-func serve(sock string, dispatchWait time.Duration) {
-	os.Remove(sock)
-
-	if dispatchWait <= 0 {
-		dispatchWait = 30 * time.Second
-	}
-
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "listen: %v\n", err)
-		os.Exit(1)
-	}
-
-	if err := os.Chmod(sock, 0700); err != nil {
-		fmt.Fprintf(os.Stderr, "broker: chmod socket: %v\n", err)
-	}
-
-	fmt.Fprintf(os.Stderr, "broker: listening on %s (dispatch wait: %s)\n", sock, dispatchWait)
-
-	p := &pool{}
-	reg := newShadowRegistry()
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sig
-		ln.Close()
-	}()
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				break
-			}
-			fmt.Fprintf(os.Stderr, "broker: accept: %v\n", err)
-			continue
+	for key, ws := range p.idle {
+		for _, w := range ws {
+			w.kill()
 		}
-		go handleConn(conn, p, reg, dispatchWait)
-	}
-
-	fmt.Fprintf(os.Stderr, "broker: shutting down\n")
-	p.drain()
-	os.Remove(sock)
-}
-
-func handleConn(conn net.Conn, p *pool, reg *shadowRegistry, dispatchWait time.Duration) {
-	reader := bufio.NewReader(conn)
-	line, err := reader.ReadString('\n')
-	if err != nil {
-		conn.Close()
-		return
-	}
-
-	trimmed := strings.TrimSpace(line)
-	if trimmed == "" {
-		conn.Close()
-		return
-	}
-
-	// Split the command line preserving empty fields between spaces.
-	// The protocol uses positional fields: "DISPATCH <model> <session>"
-	// where either field can be empty. strings.Fields would collapse
-	// consecutive spaces and lose the empty model field.
-	cmdParts := strings.SplitN(trimmed, " ", 2)
-	cmd := cmdParts[0]
-
-	// For commands other than DISPATCH, Fields-style parsing is fine
-	// since they don't have optional positional empty fields.
-	parts := strings.Fields(trimmed)
-
-	switch cmd {
-	case "WORKER":
-		// Parse "WORKER <model> <session>" with positional fields.
-		// Both model and session can be empty. Use SplitN to preserve empty fields.
-		workerArgs := ""
-		if len(cmdParts) > 1 {
-			workerArgs = cmdParts[1]
-		}
-		wFields := strings.SplitN(workerArgs, " ", 2)
-		model := ""
-		session := ""
-		if len(wFields) > 0 {
-			model = wFields[0]
-		}
-		if len(wFields) > 1 {
-			session = wFields[1]
-		}
-		p.add(conn, model, session)
-		label := "any"
-		if model != "" {
-			label = model
-		}
-		if session != "" {
-			fmt.Fprintf(os.Stderr, "broker: worker registered [%s] session=%s (pool: %d)\n", label, session, p.count())
-		} else {
-			fmt.Fprintf(os.Stderr, "broker: worker registered [%s] (pool: %d)\n", label, p.count())
-		}
-
-	case "DISPATCH":
-		// Parse "DISPATCH <model> <session>" with positional fields.
-		// Split into exactly 4 parts (cmd, model, session, rest) to
-		// preserve empty fields. "DISPATCH  sess1" => ["DISPATCH", "", "sess1"].
-		dispatchArgs := ""
-		if len(cmdParts) > 1 {
-			dispatchArgs = cmdParts[1]
-		}
-		argFields := strings.SplitN(dispatchArgs, " ", 2)
-		model := ""
-		session := ""
-		if len(argFields) > 0 {
-			model = argFields[0]
-		}
-		if len(argFields) > 1 {
-			session = argFields[1]
-		}
-
-		// Deadline prevents a stuck caller from holding a goroutine forever.
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		task, err := io.ReadAll(io.LimitReader(reader, maxPayload))
-		conn.SetReadDeadline(time.Time{}) // clear for response write
-		if err != nil {
-			fmt.Fprintf(conn, "ERROR: %v\n", err)
-			conn.Close()
-			return
-		}
-
-		// Build payload with shadow context.
-		var payload []byte
-		var s *shadow
-		if session != "" {
-			s = reg.get(session)
-		}
-		if s != nil {
-			ctx := s.snapshot()
-			if ctx != "" {
-				payload = fmt.Appendf(nil,
-					"=== CONVERSATION CONTEXT (recent messages from root session) ===\n%s\n=== END CONTEXT ===\n\nTASK: %s",
-					ctx, task,
-				)
-			} else {
-				payload = task
-			}
-		} else {
-			payload = task
-		}
-
-		target := "any"
-		if model != "" {
-			target = model
-		}
-
-		// Try to find a live worker immediately.
-		w := p.take(model, session)
-		if w == nil {
-			// No worker available — wait for one to register.
-			fmt.Fprintf(os.Stderr, "broker: no %s worker available, waiting up to %s\n", target, dispatchWait)
-			deadline := time.Now().Add(dispatchWait)
-			ch := p.wait(model, session, deadline)
-
-			timer := time.NewTimer(dispatchWait)
-			defer timer.Stop()
-
-			select {
-			case w = <-ch:
-				// Got a worker.
-			case <-timer.C:
-				p.removeWaiter(ch)
-				fmt.Fprintf(os.Stderr, "broker: dispatch timed out — no %s workers\n", target)
-				fmt.Fprintf(conn, "NO_WORKERS\n")
-				conn.Close()
-				return
-			}
-		}
-
-		// Try the worker (and any subsequent ones if stale).
-		for {
-			_, werr := w.Write(payload)
-			w.Close()
-			if werr == nil {
-				fmt.Fprintf(os.Stderr, "broker: dispatched to %s (%d bytes payload, %d bytes context, pool: %d)\n",
-					target, len(task), len(payload)-len(task), p.count())
-				fmt.Fprintf(conn, "OK\n")
-				conn.Close()
-				return
-			}
-			fmt.Fprintf(os.Stderr, "broker: stale worker removed\n")
-			w = p.take(model, session)
-			if w == nil {
-				fmt.Fprintf(os.Stderr, "broker: dispatch failed — no %s workers\n", target)
-				fmt.Fprintf(conn, "NO_WORKERS\n")
-				conn.Close()
-				return
-			}
-		}
-
-	case "SHADOW":
-		if len(parts) < 3 {
-			fmt.Fprintf(conn, "ERROR: usage: SHADOW <session-id> <transcript-path> [context-lines]\n")
-			conn.Close()
-			return
-		}
-		sessionID := parts[1]
-		txPath := parts[2]
-		ctxLines := 50
-		if len(parts) > 3 {
-			n, err := strconv.Atoi(parts[3])
-			if err != nil {
-				fmt.Fprintf(conn, "ERROR: bad context-lines: %v\n", err)
-				conn.Close()
-				return
-			}
-			ctxLines = n
-		}
-		reg.register(sessionID, txPath, ctxLines)
-		fmt.Fprintf(os.Stderr, "broker: shadow registered [%s] -> %s (context: %d)\n", sessionID, txPath, ctxLines)
-		fmt.Fprintf(conn, "OK\n")
-		conn.Close()
-
-	case "UNSHADOW":
-		if len(parts) < 2 {
-			fmt.Fprintf(conn, "ERROR: usage: UNSHADOW <session-id>\n")
-			conn.Close()
-			return
-		}
-		sessionID := parts[1]
-		reg.unregister(sessionID)
-		fmt.Fprintf(os.Stderr, "broker: shadow unregistered [%s]\n", sessionID)
-		fmt.Fprintf(conn, "OK\n")
-		conn.Close()
-
-	case "STATUS":
-		sessionID := ""
-		if len(parts) > 1 {
-			sessionID = parts[1]
-		}
-
-		var sb strings.Builder
-		if sessionID != "" {
-			// Session-scoped status.
-			shadowed := reg.has(sessionID)
-			matching := p.countForSession(sessionID)
-			fmt.Fprintf(&sb, "SESSION: %s, shadow: %t, available_workers: %d", sessionID, shadowed, matching)
-			counts := p.countsForSession(sessionID)
-			if len(counts) > 0 {
-				fmt.Fprintf(&sb, " (")
-				first := true
-				for m, c := range counts {
-					if !first {
-						fmt.Fprintf(&sb, ", ")
-					}
-					fmt.Fprintf(&sb, "%s: %d", m, c)
-					first = false
-				}
-				fmt.Fprintf(&sb, ")")
-			}
-		} else {
-			// Global status.
-			counts := p.counts()
-			fmt.Fprintf(&sb, "WORKERS: %d", p.count())
-			if len(counts) > 0 {
-				fmt.Fprintf(&sb, " (")
-				first := true
-				for m, c := range counts {
-					if !first {
-						fmt.Fprintf(&sb, ", ")
-					}
-					fmt.Fprintf(&sb, "%s: %d", m, c)
-					first = false
-				}
-				fmt.Fprintf(&sb, ")")
-			}
-			fmt.Fprintf(&sb, ", shadows: %d", reg.count())
-		}
-		fmt.Fprintf(&sb, "\n")
-		fmt.Fprint(conn, sb.String())
-		conn.Close()
-
-	default:
-		fmt.Fprintf(conn, "ERROR: unknown command: %s\n", cmd)
-		conn.Close()
+		delete(p.idle, key)
 	}
 }
 
-// --- Worker ---
-
-// worker loops internally, reconnecting to the broker every 60 seconds.
-// The agent sees a single blocking bash call that either prints a task
-// or exits cleanly on overall timeout. No agent-level looping needed.
-func worker(sock string, timeout time.Duration, model, session string) {
-	if timeout <= 0 {
-		timeout = 590 * time.Second
-	}
-	deadline := time.Now().Add(timeout)
-
-	const reconnectInterval = 60 * time.Second
-
-	for time.Now().Before(deadline) {
-		remaining := time.Until(deadline)
-		wait := min(reconnectInterval, remaining)
-
-		task := workerTryOnce(sock, model, session, wait)
-		if task != nil {
-			fmt.Print(string(task))
-			return
-		}
-	}
-
-	// Overall timeout — exit cleanly with no output.
-}
-
-// workerTryOnce connects to the broker, registers, and waits up to
-// the given duration for a task. Returns nil if no task arrived.
-func workerTryOnce(sock, model, session string, wait time.Duration) []byte {
-	conn, err := net.Dial("unix", sock)
-	if err != nil {
-		// Broker might be restarting — sleep briefly and let caller retry.
-		time.Sleep(time.Second)
-		return nil
-	}
-	defer conn.Close()
-
-	fmt.Fprintf(conn, "WORKER %s %s\n", model, session)
-
-	conn.SetReadDeadline(time.Now().Add(wait))
-
-	task, err := io.ReadAll(io.LimitReader(conn, maxPayload))
-	if err != nil {
-		if ne, ok := err.(net.Error); ok && ne.Timeout() {
-			return nil
-		}
-		return nil
-	}
-	if len(task) == 0 {
-		return nil
-	}
-	return task
-}
-
-// --- Dispatch ---
-
-const exitNoWorkers = 2
-
-func dispatch(sock, task, model, session string) {
-	conn, err := net.Dial("unix", sock)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "dispatch: connect: %v\n", err)
-		os.Exit(1)
-	}
-	defer conn.Close()
-
-	fmt.Fprintf(conn, "DISPATCH %s %s\n%s", model, session, task)
-
-	if uc, ok := conn.(*net.UnixConn); ok {
-		uc.CloseWrite()
-	}
-
-	resp, err := io.ReadAll(conn)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "dispatch: read: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Print(string(resp))
-
-	if strings.TrimSpace(string(resp)) == "NO_WORKERS" {
-		os.Exit(exitNoWorkers)
-	}
-}
-
-// --- Shadow / Unshadow CLI ---
+// --- Transcript Discovery ---
 
 // discoverTranscript finds the most recently modified .jsonl file in
-// the Claude Code project directory for the current working directory.
-// Returns the transcript path and a session ID derived from its filename.
-func discoverTranscript() (transcript, sessionID string, err error) {
+// the Claude Code project directory for the given working directory.
+func discoverTranscript(cwd string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", "", fmt.Errorf("home dir: %w", err)
+		return "", fmt.Errorf("home dir: %w", err)
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", "", fmt.Errorf("getwd: %w", err)
-	}
-
-	// Claude Code encodes the cwd by replacing "/" with "-" and prepending "-".
-	encoded := "-" + strings.ReplaceAll(cwd[1:], "/", "-")
+	// Claude Code encodes the cwd by replacing "/" and "." with "-" and prepending "-".
+	encoded := "-" + strings.NewReplacer("/", "-", ".", "-").Replace(cwd[1:])
 	projectDir := filepath.Join(home, ".claude", "projects", encoded)
 
 	entries, err := os.ReadDir(projectDir)
 	if err != nil {
-		return "", "", fmt.Errorf("read project dir %s: %w", projectDir, err)
+		return "", fmt.Errorf("read project dir %s: %w", projectDir, err)
 	}
 
 	var newest string
@@ -940,103 +584,258 @@ func discoverTranscript() (transcript, sessionID string, err error) {
 	}
 
 	if newest == "" {
-		return "", "", fmt.Errorf("no .jsonl transcripts found in %s", projectDir)
+		return "", fmt.Errorf("no .jsonl transcripts found in %s", projectDir)
 	}
 
-	transcript = filepath.Join(projectDir, newest)
-	sessionID = strings.TrimSuffix(newest, ".jsonl")
-	return transcript, sessionID, nil
+	return filepath.Join(projectDir, newest), nil
 }
 
-func shadowCmd(sock, session, transcript string, contextLines int) {
-	// Auto-discover transcript and session if not provided.
-	if session == "" && transcript == "" {
+// --- MCP Broker ---
+
+type broker struct {
+	pool *pool
+	reg  *shadowRegistry
+}
+
+func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	task, _ := args["task"].(string)
+	cwd, _ := args["cwd"].(string)
+	model, _ := args["model"].(string)
+
+	if task == "" {
+		return mcp.NewToolResultError("missing required parameter: task"), nil
+	}
+	if cwd == "" {
+		return mcp.NewToolResultError("missing required parameter: cwd"), nil
+	}
+	if model == "" {
+		model = "sonnet"
+	}
+
+	// Get or auto-register shadow for this cwd.
+	s, err := b.reg.getOrCreate(cwd)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("shadow setup: %v", err)), nil
+	}
+
+	// Build prompt with shadow context.
+	prompt := task
+	if shadowCtx := s.snapshot(); shadowCtx != "" {
+		prompt = fmt.Sprintf(
+			"=== CONVERSATION CONTEXT (recent messages from root session) ===\n%s\n=== END CONTEXT ===\n\nTASK: %s",
+			shadowCtx, task,
+		)
+	}
+
+	// Try to get an idle worker.
+	w := b.pool.take(s.cwd, model)
+	if w == nil {
+		log.Printf("no idle %s worker for %s, spawning cold", model, s.cwd)
 		var err error
-		transcript, session, err = discoverTranscript()
+		w, err = spawnFunc(s.cwd, model)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "shadow: auto-discover: %v\n", err)
-			os.Exit(1)
+			return mcp.NewToolResultError(fmt.Sprintf("spawn worker: %v", err)), nil
 		}
-	} else if session == "" {
-		fmt.Fprintln(os.Stderr, "shadow: --session is required (or omit both --session and --transcript for auto-discovery)")
-		os.Exit(1)
-	} else if transcript == "" {
-		fmt.Fprintln(os.Stderr, "shadow: --transcript is required (or omit both --session and --transcript for auto-discovery)")
-		os.Exit(1)
-	}
-
-	conn, err := net.Dial("unix", sock)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "shadow: connect: %v\n", err)
-		os.Exit(1)
-	}
-	defer conn.Close()
-
-	if contextLines > 0 {
-		fmt.Fprintf(conn, "SHADOW %s %s %d\n", session, transcript, contextLines)
 	} else {
-		fmt.Fprintf(conn, "SHADOW %s %s\n", session, transcript)
+		log.Printf("dispatching to idle %s worker for %s (pool: %d)", model, s.cwd, b.pool.count())
 	}
 
-	resp, err := io.ReadAll(conn)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "shadow: read: %v\n", err)
-		os.Exit(1)
+	// Pre-warm a replacement in the background.
+	go func() {
+		rw, err := spawnFunc(s.cwd, model)
+		if err != nil {
+			log.Printf("pre-warm failed: %v", err)
+			return
+		}
+		b.pool.put(rw)
+		log.Printf("pre-warmed %s worker for %s (pool: %d)", model, s.cwd, b.pool.count())
+	}()
+
+	// Dispatch in a goroutine so we can send progress heartbeats.
+	type dispatchResult struct {
+		text string
+		err  error
+	}
+	done := make(chan dispatchResult, 1)
+	go func() {
+		result, err := w.dispatch(prompt)
+		done <- dispatchResult{result, err}
+	}()
+
+	// Send progress notifications every 20s to keep the connection alive.
+	progressToken := req.Params.Meta.ProgressToken
+	mcpSrv := server.ServerFromContext(ctx)
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+	start := time.Now()
+
+	var result dispatchResult
+	for {
+		select {
+		case result = <-done:
+			goto finished
+		case <-ticker.C:
+			elapsed := int(time.Since(start).Seconds())
+			if mcpSrv != nil && progressToken != nil {
+				_ = mcpSrv.SendNotificationToClient(ctx, "notifications/progress", map[string]any{
+					"progressToken": progressToken,
+					"progress":      elapsed,
+					"total":         0,
+					"message":       fmt.Sprintf("Worker running (%ds)...", elapsed),
+				})
+			}
+			// Also send a log notification as fallback for clients
+			// that don't handle progress tokens.
+			if mcpSrv != nil {
+				_ = mcpSrv.SendNotificationToClient(ctx, "notifications/message", map[string]any{
+					"level": "info",
+					"data":  fmt.Sprintf("cwork: worker still running (%ds elapsed)", elapsed),
+				})
+			}
+		case <-ctx.Done():
+			w.kill()
+			return mcp.NewToolResultError("request cancelled"), nil
+		}
 	}
 
-	trimmed := strings.TrimSpace(string(resp))
-	if strings.HasPrefix(trimmed, "OK") {
-		// Print session ID so the agent can capture it.
-		fmt.Println(session)
-	} else {
-		fmt.Print(string(resp))
+finished:
+	if result.err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("worker error: %v", result.err)), nil
 	}
+
+	// On first use for this cwd, append a setup suggestion.
+	var setupHint string
+	s.first.Do(func() {
+		setupHint = `
+
+---
+SETUP NOTE: For best results, ensure the project's CLAUDE.md contains a
+cworkers directive near the top. If it doesn't have one, suggest adding
+this to the user:
+
+` + "```" + `
+## cworkers
+
+**MANDATORY**: Never run builds (make, go build, npm run, etc.), tests,
+file reads, or searches directly in the root session. Always delegate
+via the ` + "`cwork`" + ` MCP tool. The only exceptions are trivial git commands
+(git status, git diff) whose output you already know will be small.
+When in doubt, delegate.
+` + "```"
+	})
+
+	return mcp.NewToolResultText(result.text + setupHint), nil
 }
 
-func unshadowCmd(sock, session string) {
-	if session == "" {
-		fmt.Fprintln(os.Stderr, "unshadow: --session is required")
-		os.Exit(1)
-	}
+// --- HTTP Status ---
 
-	conn, err := net.Dial("unix", sock)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "unshadow: connect: %v\n", err)
-		os.Exit(1)
-	}
-	defer conn.Close()
-
-	fmt.Fprintf(conn, "UNSHADOW %s\n", session)
-
-	resp, err := io.ReadAll(conn)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "unshadow: read: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Print(string(resp))
+type statusResponse struct {
+	Workers int            `json:"workers"`
+	Models  map[string]int `json:"models"`
+	Shadows int            `json:"shadows"`
 }
 
-// --- Status ---
+func (b *broker) handleStatus(w http.ResponseWriter, _ *http.Request) {
+	resp := statusResponse{
+		Workers: b.pool.count(),
+		Models:  b.pool.counts(),
+		Shadows: b.reg.count(),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
 
-func status(sock, session string) {
-	conn, err := net.Dial("unix", sock)
+// --- Serve ---
+
+func serve(port int) {
+	b := &broker{
+		pool: newPool(),
+		reg:  newShadowRegistry(),
+	}
+
+	mcpSrv := server.NewMCPServer("cworkers", version,
+		server.WithInstructions(agentGuide),
+	)
+
+	mcpSrv.AddTool(
+		mcp.NewTool("cwork",
+			mcp.WithDescription("Dispatch a task to a worker agent. Returns the worker's result."),
+			mcp.WithString("task", mcp.Required(), mcp.Description("The task prompt for the worker")),
+			mcp.WithString("cwd", mcp.Required(), mcp.Description("Working directory of the calling session")),
+			mcp.WithString("model", mcp.Description("Model to use (default: sonnet). Options: sonnet, opus")),
+		),
+		b.handleCwork,
+	)
+
+	transport := server.NewStreamableHTTPServer(mcpSrv, server.WithStateLess(true))
+
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", transport)
+	mux.HandleFunc("/status", b.handleStatus)
+
+	httpSrv := &http.Server{
+		Addr:    fmt.Sprintf(":%d", port),
+		Handler: mux,
+	}
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sig
+		log.Println("shutting down")
+		httpSrv.Close()
+	}()
+
+	log.Printf("cworkers MCP server listening on :%d", port)
+	if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatalf("serve: %v", err)
+	}
+
+	b.pool.drain()
+}
+
+// --- Status CLI ---
+
+func statusCmd(port int) {
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/status", port))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "status: connect: %v\n", err)
 		os.Exit(1)
 	}
-	defer conn.Close()
+	defer resp.Body.Close()
 
-	if session != "" {
-		fmt.Fprintf(conn, "STATUS %s\n", session)
-	} else {
-		fmt.Fprintf(conn, "STATUS\n")
-	}
-
-	resp, err := io.ReadAll(conn)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "status: read: %v\n", err)
+	var s statusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+		fmt.Fprintf(os.Stderr, "status: decode: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Print(string(resp))
+	fmt.Printf("WORKERS: %d", s.Workers)
+	if len(s.Models) > 0 {
+		fmt.Printf(" (")
+		first := true
+		for m, c := range s.Models {
+			if !first {
+				fmt.Printf(", ")
+			}
+			fmt.Printf("%s: %d", m, c)
+			first = false
+		}
+		fmt.Printf(")")
+	}
+	fmt.Printf(", shadows: %d\n", s.Shadows)
+}
+
+// --- Utility ---
+
+func filterEnv(env []string, exclude string) []string {
+	prefix := exclude + "="
+	var result []string
+	for _, e := range env {
+		if !strings.HasPrefix(e, prefix) {
+			result = append(result, e)
+		}
+	}
+	return result
 }
