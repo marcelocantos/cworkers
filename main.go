@@ -32,6 +32,8 @@ var agentGuide string
 
 var version = "dev"
 
+var debug bool
+
 const defaultPort = 4242
 
 func main() {
@@ -51,6 +53,9 @@ func main() {
 			fmt.Println()
 			fmt.Print(agentGuide)
 			return
+		case args[i] == "--debug":
+			debug = true
+			args = append(args[:i], args[i+1:]...)
 		case args[i] == "--port" && i+1 < len(args):
 			n, err := strconv.Atoi(args[i+1])
 			if err != nil {
@@ -305,7 +310,7 @@ func processLine(line []byte, s *shadow) {
 //
 // Non-heading text is suppressed entirely.
 type progressThrottle struct {
-	lastSent [2]time.Time // tiers 0 and 1 only; tier 2 is always suppressed
+	lastSent  [2]time.Time // tiers 0 and 1 only; tier 2 is always suppressed
 	intervals [2]time.Duration
 }
 
@@ -461,6 +466,10 @@ func (w *workerProc) dispatch(prompt string, onText func(string)) (string, error
 			continue
 		}
 
+		if debug {
+			log.Printf("ndjson [%s]: type=%s line=%.200s", w.model, base.Type, line)
+		}
+
 		switch base.Type {
 		case "assistant":
 			var msg struct {
@@ -474,6 +483,9 @@ func (w *workerProc) dispatch(prompt string, onText func(string)) (string, error
 			if json.Unmarshal(line, &msg) == nil {
 				for _, b := range msg.Message.Content {
 					if b.Type == "text" && b.Text != "" {
+						if debug {
+							log.Printf("onText [%s]: %.200s", w.model, b.Text)
+						}
 						textParts = append(textParts, b.Text)
 						if onText != nil {
 							onText(b.Text)
@@ -719,37 +731,66 @@ func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp
 
 	sendProgress := func(msg string) {
 		if mcpSrv == nil {
+			log.Printf("sendProgress: no MCP server in context")
 			return
+		}
+		if debug {
+			log.Printf("sendProgress: msg=%q progressToken=%v", msg, progressToken)
 		}
 		elapsed := int(time.Since(start).Seconds())
 		if progressToken != nil {
-			_ = mcpSrv.SendNotificationToClient(ctx, "notifications/progress", map[string]any{
+			err := mcpSrv.SendNotificationToClient(ctx, "notifications/progress", map[string]any{
 				"progressToken": progressToken,
 				"progress":      elapsed,
 				"total":         0,
 				"message":       msg,
 			})
+			if err != nil {
+				log.Printf("sendProgress (progress): %v", err)
+			} else if debug {
+				log.Printf("sendProgress (progress): sent OK")
+			}
 		}
-		_ = mcpSrv.SendNotificationToClient(ctx, "notifications/message", map[string]any{
+		err := mcpSrv.SendNotificationToClient(ctx, "notifications/message", map[string]any{
 			"level": "info",
 			"data":  fmt.Sprintf("cwork: %s", msg),
 		})
+		if err != nil {
+			log.Printf("sendProgress (message): %v", err)
+		} else if debug {
+			log.Printf("sendProgress (message): sent OK")
+		}
 	}
 
-	// Track last activity to send fallback heartbeats during silent periods.
+	// Track last activity and most recent heading for heartbeat context.
 	var lastActivity atomic.Int64
 	lastActivity.Store(time.Now().UnixMilli())
+	var lastHeadingMu sync.Mutex
+	lastHeading := "(no status yet)"
 
-	// onText is called by dispatch for each assistant text fragment.
-	// Extract heading lines and forward them through the throttle.
+	// onText is called by dispatch for each assistant text chunk.
+	// Each call is one turn's text — check for heading prefix directly.
 	onText := func(text string) {
 		lastActivity.Store(time.Now().UnixMilli())
-		for _, line := range strings.Split(text, "\n") {
-			line = strings.TrimSpace(line)
-			tier := headingTier(line)
-			if tier >= 0 && throttle.shouldForward(tier) {
-				sendProgress(line)
+		line := strings.TrimSpace(text)
+		tier := headingTier(line)
+		if tier < 0 {
+			return
+		}
+		// Extract just the first line if the chunk contains more.
+		if idx := strings.IndexByte(line, '\n'); idx >= 0 {
+			line = line[:idx]
+		}
+		lastHeadingMu.Lock()
+		lastHeading = line
+		lastHeadingMu.Unlock()
+		if throttle.shouldForward(tier) {
+			elapsed := int(time.Since(start).Seconds())
+			msg := fmt.Sprintf("[%ds] %s", elapsed, line)
+			if debug {
+				log.Printf("progress: %s", msg)
 			}
+			sendProgress(msg)
 		}
 	}
 
@@ -776,8 +817,16 @@ func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp
 			goto finished
 		case <-ticker.C:
 			lastMs := lastActivity.Load()
-			if time.Since(time.UnixMilli(lastMs)) >= 30*time.Second {
-				sendProgress(fmt.Sprintf("Worker running (%ds)...", int(time.Since(start).Seconds())))
+			silent := time.Since(time.UnixMilli(lastMs))
+			if debug {
+				log.Printf("heartbeat tick: silent=%v", silent.Round(time.Second))
+			}
+			if silent >= 30*time.Second {
+				elapsed := int(time.Since(start).Seconds())
+				lastHeadingMu.Lock()
+				h := lastHeading
+				lastHeadingMu.Unlock()
+				sendProgress(fmt.Sprintf("[%ds] %s", elapsed, h))
 				lastActivity.Store(time.Now().UnixMilli())
 			}
 		case <-ctx.Done():
@@ -855,7 +904,7 @@ func serve(port int) {
 		b.handleCwork,
 	)
 
-	transport := server.NewStreamableHTTPServer(mcpSrv, server.WithStateLess(true))
+	transport := server.NewStreamableHTTPServer(mcpSrv)
 
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", transport)
