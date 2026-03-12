@@ -6,12 +6,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -23,12 +25,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
 //go:embed help-agent.md
 var agentGuide string
+
+//go:embed dashboard/dist/index.html
+var dashboardHTML string
 
 var version = "dev"
 
@@ -362,8 +369,11 @@ type workerProc struct {
 	stdout io.ReadCloser
 	cwd    string
 	model  string
+	depth  int
 	cancel context.CancelFunc
 }
+
+const maxDepth = 3
 
 // spawnFunc is the function used to create workers. Replaced in tests.
 var spawnFunc = spawnWorker
@@ -371,7 +381,8 @@ var spawnFunc = spawnWorker
 // spawnWorker starts a claude -p process ready to receive a prompt on stdin.
 // The process initialises while stdin is held open; when a task arrives
 // the broker writes the prompt and closes stdin to trigger execution.
-func spawnWorker(cwd, model string) (*workerProc, error) {
+// wid is the worker ID that children of this worker will use as their parent.
+func spawnWorker(cwd, model string, port, depth int, wid string) (*workerProc, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	args := []string{
@@ -382,6 +393,14 @@ func spawnWorker(cwd, model string) (*workerProc, error) {
 	}
 	if model != "" {
 		args = append(args, "--model", model)
+	}
+	// Give workers access to cwork at the next depth level, unless at max.
+	if depth < maxDepth {
+		mcpCfg := fmt.Sprintf(
+			`{"mcpServers":{"cworkers":{"type":"http","url":"http://localhost:%d/mcp?depth=%d&wid=%s"}}}`,
+			port, depth+1, wid,
+		)
+		args = append(args, "--mcp-config", mcpCfg)
 	}
 
 	cmd := exec.CommandContext(ctx, "claude", args...)
@@ -417,7 +436,7 @@ func spawnWorker(cwd, model string) (*workerProc, error) {
 		scanner := bufio.NewScanner(stderr)
 		scanner.Buffer(make([]byte, 256*1024), 256*1024)
 		for scanner.Scan() {
-			log.Printf("claude stderr [%s]: %s", model, scanner.Text())
+			log.Printf("[%s] stderr: %s", wid, scanner.Text())
 		}
 	}()
 
@@ -427,6 +446,7 @@ func spawnWorker(cwd, model string) (*workerProc, error) {
 		stdout: stdout,
 		cwd:    cwd,
 		model:  model,
+		depth:  depth,
 		cancel: cancel,
 	}, nil
 }
@@ -434,7 +454,7 @@ func spawnWorker(cwd, model string) (*workerProc, error) {
 // dispatch sends a prompt to the worker and blocks until it returns a result.
 // The onText callback is called with each new text fragment as it arrives from
 // the worker's assistant output, enabling real-time progress reporting.
-func (w *workerProc) dispatch(prompt string, onText func(string)) (string, error) {
+func (w *workerProc) dispatch(prompt string, wid string, onText func(string), onToolUse func(name string), onLine func(lineType string, raw []byte)) (string, error) {
 	// Write prompt and close stdin to signal EOF.
 	if _, err := io.WriteString(w.stdin, prompt); err != nil {
 		w.cancel()
@@ -462,12 +482,17 @@ func (w *workerProc) dispatch(prompt string, onText func(string)) (string, error
 			Type string `json:"type"`
 		}
 		if json.Unmarshal(line, &base) != nil {
-			log.Printf("worker [%s]: unparseable line: %.100s", w.model, line)
+			log.Printf("[%s] unparseable line: %.100s", wid, line)
 			continue
 		}
 
 		if debug {
-			log.Printf("ndjson [%s]: type=%s line=%.200s", w.model, base.Type, line)
+			log.Printf("[%s] ndjson: type=%s line=%.200s", wid, base.Type, line)
+		}
+
+		if onLine != nil {
+			// Store a copy — scanner reuses the buffer.
+			onLine(base.Type, append([]byte(nil), line...))
 		}
 
 		switch base.Type {
@@ -477,18 +502,27 @@ func (w *workerProc) dispatch(prompt string, onText func(string)) (string, error
 					Content []struct {
 						Type string `json:"type"`
 						Text string `json:"text"`
+						Name string `json:"name"`
 					} `json:"content"`
 				} `json:"message"`
 			}
 			if json.Unmarshal(line, &msg) == nil {
 				for _, b := range msg.Message.Content {
-					if b.Type == "text" && b.Text != "" {
+					switch {
+					case b.Type == "text" && b.Text != "":
 						if debug {
-							log.Printf("onText [%s]: %.200s", w.model, b.Text)
+							log.Printf("[%s] onText: %.200s", wid, b.Text)
 						}
 						textParts = append(textParts, b.Text)
 						if onText != nil {
 							onText(b.Text)
+						}
+					case b.Type == "tool_use" && b.Name != "":
+						if debug {
+							log.Printf("[%s] onToolUse: %s", wid, b.Name)
+						}
+						if onToolUse != nil {
+							onToolUse(b.Name)
 						}
 					}
 				}
@@ -518,8 +552,8 @@ func (w *workerProc) dispatch(prompt string, onText func(string)) (string, error
 	// Wait for process to exit.
 	waitErr := w.cmd.Wait()
 
-	log.Printf("worker [%s]: done, %d NDJSON lines, result=%d bytes, textParts=%d, err=%q, waitErr=%v",
-		w.model, lineCount, len(resultText), len(textParts), errMsg, waitErr)
+	log.Printf("[%s] done: %d NDJSON lines, result=%d bytes, textParts=%d, err=%q, waitErr=%v",
+		wid, lineCount, len(resultText), len(textParts), errMsg, waitErr)
 
 	if resultText != "" {
 		return resultText, nil
@@ -545,24 +579,29 @@ func (w *workerProc) kill() {
 // --- Pool ---
 
 type pool struct {
-	mu   sync.Mutex
-	idle map[string][]*workerProc // key: cwd + "\x00" + model
+	mu         sync.Mutex
+	idle       map[string][]*workerProc // key: cwd + "\x00" + model
+	maxIdlePer int
 }
 
-func newPool() *pool {
+func newPool(maxIdlePerKey int) *pool {
+	if maxIdlePerKey <= 0 {
+		maxIdlePerKey = 1
+	}
 	return &pool{
-		idle: make(map[string][]*workerProc),
+		idle:       make(map[string][]*workerProc),
+		maxIdlePer: maxIdlePerKey,
 	}
 }
 
-func poolKey(cwd, model string) string {
-	return cwd + "\x00" + model
+func poolKey(cwd, model string, depth int) string {
+	return fmt.Sprintf("%s\x00%s\x00%d", cwd, model, depth)
 }
 
-func (p *pool) take(cwd, model string) *workerProc {
+func (p *pool) take(cwd, model string, depth int) *workerProc {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	key := poolKey(cwd, model)
+	key := poolKey(cwd, model, depth)
 	workers := p.idle[key]
 	if len(workers) == 0 {
 		return nil
@@ -578,7 +617,12 @@ func (p *pool) take(cwd, model string) *workerProc {
 func (p *pool) put(w *workerProc) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	key := poolKey(w.cwd, w.model)
+	key := poolKey(w.cwd, w.model, w.depth)
+	if len(p.idle[key]) >= p.maxIdlePer {
+		w.kill()
+		log.Printf("pool: discarded excess %s worker for %s (cap %d)", w.model, w.cwd, p.maxIdlePer)
+		return
+	}
 	p.idle[key] = append(p.idle[key], w)
 }
 
@@ -661,11 +705,386 @@ func discoverTranscript(cwd string) (string, error) {
 	return filepath.Join(projectDir, newest), nil
 }
 
+// --- Depth context ---
+
+type contextKey string
+
+const depthKey contextKey = "depth"
+const parentIDKey contextKey = "parentID"
+
+func depthFromContext(ctx context.Context) int {
+	if v, ok := ctx.Value(depthKey).(int); ok {
+		return v
+	}
+	return 0
+}
+
+func parentIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(parentIDKey).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// delegationGuidance returns prompt text that progressively discourages
+// further cwork delegation as depth increases.
+func delegationGuidance(depth int) string {
+	switch {
+	case depth <= 0:
+		return ""
+	case depth == 1:
+		return `
+=== DELEGATION POLICY ===
+You have access to cwork for sub-delegation, but prefer doing the work
+yourself. Only delegate if the task clearly decomposes into independent
+subtasks that would benefit from parallelism. For sequential work, just
+do it directly.
+=== END POLICY ===
+`
+	case depth == 2:
+		return `
+=== DELEGATION POLICY ===
+You have access to cwork but you SHOULD NOT use it unless the task is
+very large with obviously independent parts. Do the work yourself.
+=== END POLICY ===
+`
+	default:
+		return `
+=== DELEGATION POLICY ===
+You are at maximum delegation depth. cwork calls WILL FAIL. Do all work
+directly — do not attempt to delegate.
+=== END POLICY ===
+`
+	}
+}
+
+// --- SQLite Store ---
+
+const dbSchema = `
+CREATE TABLE IF NOT EXISTS sessions (
+	id TEXT PRIMARY KEY,
+	client_name TEXT NOT NULL DEFAULT '',
+	client_version TEXT NOT NULL DEFAULT '',
+	cwd TEXT NOT NULL DEFAULT '',
+	transcript TEXT NOT NULL DEFAULT '',
+	depth INTEGER NOT NULL DEFAULT 0,
+	connected_at TEXT NOT NULL,
+	disconnected_at TEXT
+);
+CREATE TABLE IF NOT EXISTS workers (
+	id TEXT PRIMARY KEY,
+	parent_id TEXT,
+	display_name TEXT NOT NULL,
+	cwd TEXT NOT NULL,
+	model TEXT NOT NULL,
+	task TEXT NOT NULL,
+	status TEXT NOT NULL DEFAULT 'running',
+	started_at TEXT NOT NULL,
+	ended_at TEXT
+);
+CREATE TABLE IF NOT EXISTS events (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	worker_id TEXT NOT NULL REFERENCES workers(id),
+	type TEXT NOT NULL,
+	data TEXT NOT NULL,
+	created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_worker ON events(worker_id);
+CREATE INDEX IF NOT EXISTS idx_workers_cwd ON workers(cwd);
+CREATE INDEX IF NOT EXISTS idx_workers_status ON workers(status);
+CREATE INDEX IF NOT EXISTS idx_sessions_connected ON sessions(connected_at);
+`
+
+func initDB(path string) (*sql.DB, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("create db dir: %w", err)
+	}
+	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000")
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	if _, err := db.Exec(dbSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("init schema: %w", err)
+	}
+	// Migrations: add columns/indexes that may not exist in older DBs.
+	db.Exec(`ALTER TABLE workers ADD COLUMN session_id TEXT REFERENCES sessions(id)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_workers_session ON workers(session_id)`)
+	db.Exec(`ALTER TABLE sessions ADD COLUMN cwd TEXT NOT NULL DEFAULT ''`)
+	db.Exec(`ALTER TABLE sessions ADD COLUMN transcript TEXT NOT NULL DEFAULT ''`)
+	db.Exec(`ALTER TABLE sessions ADD COLUMN depth INTEGER NOT NULL DEFAULT 0`)
+
+	// Purge sessions from previous server runs. They're ephemeral —
+	// active clients will reconnect and get fresh registrations.
+	db.Exec(`DELETE FROM sessions`)
+
+	return db, nil
+}
+
+func newWorkerID() string {
+	return uuid.Must(uuid.NewV7()).String()
+}
+
+// sessionRow is the JSON shape returned by the sessions API.
+type sessionRow struct {
+	ID             string  `json:"id"`
+	ClientName     string  `json:"client_name"`
+	ClientVersion  string  `json:"client_version"`
+	CWD            string  `json:"cwd"`
+	Transcript     string  `json:"transcript"`
+	Depth          int     `json:"depth"`
+	ConnectedAt    string  `json:"connected_at"`
+	DisconnectedAt *string `json:"disconnected_at,omitempty"`
+}
+
+// workerRow is the JSON shape returned by the workers API (no events).
+type workerRow struct {
+	ID          string  `json:"id"`
+	SessionID   *string `json:"session_id,omitempty"`
+	ParentID    *string `json:"parent_id"`
+	DisplayName string  `json:"display_name"`
+	CWD         string  `json:"cwd"`
+	Model       string  `json:"model"`
+	Task        string  `json:"task"`
+	Status      string  `json:"status"`
+	StartedAt   string  `json:"started_at"`
+	EndedAt     *string `json:"ended_at,omitempty"`
+}
+
+// eventRow is the JSON shape returned by the events API.
+type eventRow struct {
+	ID        int64  `json:"id"`
+	Type      string `json:"type"`
+	Data      string `json:"data"`
+	CreatedAt string `json:"created_at"`
+}
+
+// --- SSE Messages ---
+
+type sseMsg struct {
+	Event string `json:"event"`
+	// Only one of the following is set, depending on Event.
+	Worker  *workerRow  `json:"worker,omitempty"`
+	Session *sessionRow `json:"session,omitempty"`
+	ID      string      `json:"id,omitempty"`
+	Entry   *eventRow   `json:"entry,omitempty"`
+	Status  string      `json:"status,omitempty"`
+}
+
+func (m sseMsg) encode() []byte {
+	data, _ := json.Marshal(m)
+	return data
+}
+
+// writeSSE writes an SSE data frame and flushes.
+func writeSSE(w http.ResponseWriter, flusher http.Flusher, msg sseMsg) {
+	fmt.Fprintf(w, "data: %s\n\n", msg.encode())
+	flusher.Flush()
+}
+
+// --- SSE Event Hub ---
+
+type sseClient struct {
+	ch       chan []byte
+	workerID string // empty = lifecycle only; set = also receive events for this worker
+}
+
+type eventHub struct {
+	mu      sync.RWMutex
+	clients map[*sseClient]struct{}
+}
+
+func newEventHub() *eventHub {
+	return &eventHub{clients: make(map[*sseClient]struct{})}
+}
+
+func (h *eventHub) subscribe(workerID string) *sseClient {
+	c := &sseClient{
+		ch:       make(chan []byte, 64),
+		workerID: workerID,
+	}
+	h.mu.Lock()
+	h.clients[c] = struct{}{}
+	h.mu.Unlock()
+	return c
+}
+
+func (h *eventHub) unsubscribe(c *sseClient) {
+	h.mu.Lock()
+	delete(h.clients, c)
+	close(c.ch)
+	h.mu.Unlock()
+}
+
+// broadcastLifecycle sends a lifecycle event (worker_start, worker_done)
+// to all connected clients.
+func (h *eventHub) broadcastLifecycle(data []byte) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for c := range h.clients {
+		select {
+		case c.ch <- data:
+		default:
+		}
+	}
+}
+
+// sendWorkerEvent sends a worker_event only to clients subscribed to
+// the given worker ID.
+func (h *eventHub) sendWorkerEvent(workerID string, data []byte) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for c := range h.clients {
+		if c.workerID == workerID {
+			select {
+			case c.ch <- data:
+			default:
+			}
+		}
+	}
+}
+
 // --- MCP Broker ---
 
 type broker struct {
-	pool *pool
-	reg  *shadowRegistry
+	pool   *pool
+	reg    *shadowRegistry
+	port   int
+	db     *sql.DB
+	mu     sync.Mutex
+	active map[*workerProc]struct{}
+	nextID atomic.Int64
+
+	eventHub *eventHub
+}
+
+// nextDisplayID generates a sequential integer for building hierarchical
+// display names (e.g. "w3", which a child extends to "w3.1").
+func (b *broker) nextDisplayID() int64 {
+	return b.nextID.Add(1)
+}
+
+func (b *broker) registerSession(sessionID, clientName, clientVersion string, depth int) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := b.db.Exec(
+		`INSERT OR REPLACE INTO sessions (id, client_name, client_version, cwd, depth, connected_at) VALUES (?, ?, ?, '', ?, ?)`,
+		sessionID, clientName, clientVersion, depth, now,
+	)
+	if err != nil {
+		log.Printf("db: insert session: %v", err)
+		return
+	}
+	row := sessionRow{
+		ID: sessionID, ClientName: clientName, ClientVersion: clientVersion, Depth: depth, ConnectedAt: now,
+	}
+	b.eventHub.broadcastLifecycle(sseMsg{Event: "session_start", Session: &row}.encode())
+}
+
+func (b *broker) updateSessionCWD(sessionID, cwd string) {
+	// Best-effort transcript discovery from CWD.
+	var transcript string
+	if tp, err := discoverTranscript(cwd); err == nil {
+		// Store just the base filename (which is the Claude Code session ID).
+		transcript = strings.TrimSuffix(filepath.Base(tp), ".jsonl")
+		log.Printf("session %s: transcript=%s", sessionID, transcript)
+	}
+
+	_, err := b.db.Exec(`UPDATE sessions SET cwd = ?, transcript = ? WHERE id = ?`, cwd, transcript, sessionID)
+	if err != nil {
+		log.Printf("db: update session cwd: %v", err)
+		return
+	}
+	row := sessionRow{ID: sessionID, CWD: cwd, Transcript: transcript}
+	b.eventHub.broadcastLifecycle(sseMsg{Event: "session_update", Session: &row}.encode())
+}
+
+func (b *broker) disconnectSession(sessionID string) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := b.db.Exec(
+		`UPDATE sessions SET disconnected_at = ? WHERE id = ? AND disconnected_at IS NULL`,
+		now, sessionID,
+	)
+	if err != nil {
+		log.Printf("db: disconnect session: %v", err)
+		return
+	}
+	b.eventHub.broadcastLifecycle(sseMsg{Event: "session_end", ID: sessionID}.encode())
+}
+
+func (b *broker) registerWorker(id, sessionID, parentID, displayName, cwd, model, task string) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var parentPtr, sessionPtr *string
+	if parentID != "" {
+		parentPtr = &parentID
+	}
+	if sessionID != "" {
+		sessionPtr = &sessionID
+	}
+
+	_, err := b.db.Exec(
+		`INSERT INTO workers (id, session_id, parent_id, display_name, cwd, model, task, status, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
+		id, sessionPtr, parentPtr, displayName, cwd, model, task, now,
+	)
+	if err != nil {
+		log.Printf("db: insert worker: %v", err)
+		return
+	}
+
+	row := workerRow{
+		ID: id, SessionID: sessionPtr, ParentID: parentPtr, DisplayName: displayName,
+		CWD: cwd, Model: model, Task: task, Status: "running", StartedAt: now,
+	}
+	b.eventHub.broadcastLifecycle(sseMsg{Event: "worker_start", Worker: &row}.encode())
+}
+
+func (b *broker) appendEvent(workerID, evType, evData string) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := b.db.Exec(
+		`INSERT INTO events (worker_id, type, data, created_at) VALUES (?, ?, ?, ?)`,
+		workerID, evType, evData, now,
+	)
+	if err != nil {
+		log.Printf("db: insert event: %v", err)
+		return
+	}
+
+	entry := eventRow{Type: evType, Data: evData, CreatedAt: now}
+	b.eventHub.sendWorkerEvent(workerID, sseMsg{Event: "worker_event", ID: workerID, Entry: &entry}.encode())
+}
+
+func (b *broker) finishWorker(id, status string) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := b.db.Exec(
+		`UPDATE workers SET status = ?, ended_at = ? WHERE id = ?`,
+		status, now, id,
+	)
+	if err != nil {
+		log.Printf("db: finish worker: %v", err)
+		return
+	}
+
+	b.eventHub.broadcastLifecycle(sseMsg{Event: "worker_done", ID: id, Status: status}.encode())
+}
+
+func (b *broker) trackWorker(w *workerProc) {
+	b.mu.Lock()
+	b.active[w] = struct{}{}
+	b.mu.Unlock()
+}
+
+func (b *broker) untrackWorker(w *workerProc) {
+	b.mu.Lock()
+	delete(b.active, w)
+	b.mu.Unlock()
+}
+
+func (b *broker) shutdown() {
+	b.pool.drain()
+	b.mu.Lock()
+	for w := range b.active {
+		w.kill()
+	}
+	b.mu.Unlock()
 }
 
 func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -673,6 +1092,25 @@ func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	task, _ := args["task"].(string)
 	cwd, _ := args["cwd"].(string)
 	model, _ := args["model"].(string)
+	depth := depthFromContext(ctx)
+	parentWID := parentIDFromContext(ctx)
+
+	// Build hierarchical display name: w1, w1.1, w1.1.2, etc.
+	seq := b.nextDisplayID()
+	var displayName string
+	if parentWID != "" {
+		displayName = fmt.Sprintf("%s.%d", parentWID, seq)
+	} else {
+		displayName = fmt.Sprintf("w%d", seq)
+	}
+
+	// UUIDv7 for DB/API identity.
+	id := newWorkerID()
+
+	if depth >= maxDepth {
+		log.Printf("[%s] rejected: max depth %d reached", displayName, maxDepth)
+		return mcp.NewToolResultError(fmt.Sprintf("cwork rejected: maximum delegation depth (%d) reached — do the work directly", maxDepth)), nil
+	}
 
 	if task == "" {
 		return mcp.NewToolResultError("missing required parameter: task"), nil
@@ -684,43 +1122,62 @@ func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		model = "sonnet"
 	}
 
+	// Extract MCP session ID for linking workers to sessions.
+	var sessionID string
+	if cs := server.ClientSessionFromContext(ctx); cs != nil {
+		sessionID = cs.SessionID()
+	}
+
+	log.Printf("[%s] cwork request: depth=%d model=%s cwd=%s session=%s task=%.100s", displayName, depth, model, cwd, sessionID, task)
+
+	// Register worker for dashboard tracking.
+	taskSummary := task
+	if len(taskSummary) > 200 {
+		taskSummary = taskSummary[:200] + "..."
+	}
+	b.registerWorker(id, sessionID, parentWID, displayName, cwd, model, taskSummary)
+
 	// Get or auto-register shadow for this cwd.
 	s, err := b.reg.getOrCreate(cwd)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("shadow setup: %v", err)), nil
 	}
 
-	// Build prompt with shadow context.
-	prompt := task
+	// Build prompt with shadow context and delegation guidance.
+	var promptParts []string
+	if guidance := delegationGuidance(depth); guidance != "" {
+		promptParts = append(promptParts, guidance)
+	}
 	if shadowCtx := s.snapshot(); shadowCtx != "" {
-		prompt = fmt.Sprintf(
-			"=== CONVERSATION CONTEXT (recent messages from root session) ===\n%s\n=== END CONTEXT ===\n\nTASK: %s",
-			shadowCtx, task,
+		promptParts = append(promptParts,
+			fmt.Sprintf("=== CONVERSATION CONTEXT (recent messages from root session) ===\n%s\n=== END CONTEXT ===", shadowCtx),
 		)
 	}
+	promptParts = append(promptParts, fmt.Sprintf("TASK: %s", task))
+	prompt := strings.Join(promptParts, "\n\n")
 
 	// Try to get an idle worker.
-	w := b.pool.take(s.cwd, model)
+	w := b.pool.take(s.cwd, model, depth)
 	if w == nil {
-		log.Printf("no idle %s worker for %s, spawning cold", model, s.cwd)
+		log.Printf("[%s] no idle %s worker, spawning cold", displayName, model)
 		var err error
-		w, err = spawnFunc(s.cwd, model)
+		w, err = spawnFunc(s.cwd, model, b.port, depth, displayName)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("spawn worker: %v", err)), nil
 		}
 	} else {
-		log.Printf("dispatching to idle %s worker for %s (pool: %d)", model, s.cwd, b.pool.count())
+		log.Printf("[%s] dispatching to idle %s worker (pool: %d)", displayName, model, b.pool.count())
 	}
 
 	// Pre-warm a replacement in the background.
 	go func() {
-		rw, err := spawnFunc(s.cwd, model)
+		rw, err := spawnFunc(s.cwd, model, b.port, depth, displayName)
 		if err != nil {
-			log.Printf("pre-warm failed: %v", err)
+			log.Printf("[%s] pre-warm failed: %v", displayName, err)
 			return
 		}
 		b.pool.put(rw)
-		log.Printf("pre-warmed %s worker for %s (pool: %d)", model, s.cwd, b.pool.count())
+		log.Printf("[%s] pre-warmed %s worker (pool: %d)", displayName, model, b.pool.count())
 	}()
 
 	// Set up content-driven progress notifications.
@@ -767,6 +1224,7 @@ func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	lastActivity.Store(time.Now().UnixMilli())
 	var lastHeadingMu sync.Mutex
 	lastHeading := "(no status yet)"
+	hadHeading := false
 
 	// onText is called by dispatch for each assistant text chunk.
 	// Each call is one turn's text — check for heading prefix directly.
@@ -783,6 +1241,7 @@ func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		}
 		lastHeadingMu.Lock()
 		lastHeading = line
+		hadHeading = true
 		lastHeadingMu.Unlock()
 		if throttle.shouldForward(tier) {
 			elapsed := int(time.Since(start).Seconds())
@@ -794,14 +1253,37 @@ func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		}
 	}
 
+	// onToolUse is called by dispatch for each tool_use content block.
+	// When no heading has been seen yet, forward the tool name as a
+	// low-priority progress indicator so the caller isn't left blind.
+	onToolUse := func(name string) {
+		lastActivity.Store(time.Now().UnixMilli())
+		lastHeadingMu.Lock()
+		haveHeading := hadHeading
+		if !haveHeading {
+			lastHeading = fmt.Sprintf("using %s", name)
+		}
+		lastHeadingMu.Unlock()
+		if !haveHeading && throttle.shouldForward(1) {
+			elapsed := int(time.Since(start).Seconds())
+			sendProgress(fmt.Sprintf("[%ds] using %s", elapsed, name))
+		}
+	}
+
+	// onLine stores every raw NDJSON line in the event log.
+	onLine := func(lineType string, raw []byte) {
+		b.appendEvent(id, lineType, string(raw))
+	}
+
 	// Dispatch in a goroutine so we can handle cancellation and heartbeats.
+	b.trackWorker(w)
 	type dispatchResult struct {
 		text string
 		err  error
 	}
 	done := make(chan dispatchResult, 1)
 	go func() {
-		result, err := w.dispatch(prompt, onText)
+		result, err := w.dispatch(prompt, displayName, onText, onToolUse, onLine)
 		done <- dispatchResult{result, err}
 	}()
 
@@ -830,15 +1312,20 @@ func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp
 				lastActivity.Store(time.Now().UnixMilli())
 			}
 		case <-ctx.Done():
+			b.untrackWorker(w)
+			b.finishWorker(id, "error")
 			w.kill()
 			return mcp.NewToolResultError("request cancelled"), nil
 		}
 	}
 
 finished:
+	b.untrackWorker(w)
 	if result.err != nil {
+		b.finishWorker(id, "error")
 		return mcp.NewToolResultError(fmt.Sprintf("worker error: %v", result.err)), nil
 	}
+	b.finishWorker(id, "done")
 
 	// On first use for this cwd, append a setup suggestion.
 	var setupHint string
@@ -882,17 +1369,184 @@ func (b *broker) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// --- Dashboard HTTP handlers ---
+
+func (b *broker) handleDashboard(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	io.WriteString(w, dashboardHTML)
+}
+
+func (b *broker) handleAPISessions(w http.ResponseWriter, _ *http.Request) {
+	rows, err := b.db.Query(`SELECT id, client_name, client_version, cwd, transcript, depth, connected_at, disconnected_at FROM sessions ORDER BY connected_at`)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("db query: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	list := make([]sessionRow, 0)
+	for rows.Next() {
+		var r sessionRow
+		if err := rows.Scan(&r.ID, &r.ClientName, &r.ClientVersion, &r.CWD, &r.Transcript, &r.Depth, &r.ConnectedAt, &r.DisconnectedAt); err != nil {
+			http.Error(w, fmt.Sprintf("db scan: %v", err), http.StatusInternalServerError)
+			return
+		}
+		list = append(list, r)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(list)
+}
+
+func (b *broker) handleAPIWorkers(w http.ResponseWriter, _ *http.Request) {
+	rows, err := b.db.Query(`SELECT id, session_id, parent_id, display_name, cwd, model, task, status, started_at, ended_at FROM workers ORDER BY started_at`)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("db query: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	list := make([]workerRow, 0)
+	for rows.Next() {
+		var r workerRow
+		if err := rows.Scan(&r.ID, &r.SessionID, &r.ParentID, &r.DisplayName, &r.CWD, &r.Model, &r.Task, &r.Status, &r.StartedAt, &r.EndedAt); err != nil {
+			http.Error(w, fmt.Sprintf("db scan: %v", err), http.StatusInternalServerError)
+			return
+		}
+		list = append(list, r)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(list)
+}
+
+func (b *broker) handleWorkerEvents(w http.ResponseWriter, r *http.Request) {
+	workerID := r.PathValue("id")
+	if workerID == "" {
+		http.Error(w, "missing worker id", http.StatusBadRequest)
+		return
+	}
+
+	rows, err := b.db.Query(`SELECT id, type, data, created_at FROM events WHERE worker_id = ? ORDER BY id`, workerID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("db query: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	list := make([]eventRow, 0)
+	for rows.Next() {
+		var r eventRow
+		if err := rows.Scan(&r.ID, &r.Type, &r.Data, &r.CreatedAt); err != nil {
+			http.Error(w, fmt.Sprintf("db scan: %v", err), http.StatusInternalServerError)
+			return
+		}
+		list = append(list, r)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(list)
+}
+
+func (b *broker) handleSSE(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	flusher.Flush()
+
+	// Send a hello event so the client knows the connection is live.
+	writeSSE(w, flusher, sseMsg{Event: "hello"})
+
+	workerID := r.URL.Query().Get("worker_id")
+	c := b.eventHub.subscribe(workerID)
+	defer b.eventHub.unsubscribe(c)
+
+	for {
+		select {
+		case data := <-c.ch:
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
 // --- Serve ---
 
 func serve(port int) {
-	b := &broker{
-		pool: newPool(),
-		reg:  newShadowRegistry(),
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("home dir: %v", err)
 	}
+	dbPath := filepath.Join(homeDir, ".local", "share", "cworkers", "cworkers.db")
+	db, err := initDB(dbPath)
+	if err != nil {
+		log.Fatalf("init db: %v", err)
+	}
+	defer db.Close()
+
+	b := &broker{
+		pool:     newPool(1),
+		reg:      newShadowRegistry(),
+		port:     port,
+		db:       db,
+		active:   make(map[*workerProc]struct{}),
+		eventHub: newEventHub(),
+	}
+
+	hooks := &server.Hooks{}
 
 	mcpSrv := server.NewMCPServer("cworkers", version,
 		server.WithInstructions(agentGuide),
+		server.WithHooks(hooks),
 	)
+
+	hooks.AddOnRegisterSession(func(ctx context.Context, session server.ClientSession) {
+		sid := session.SessionID()
+		depth := depthFromContext(ctx)
+		var clientName, clientVersion string
+		if ci, ok := session.(server.SessionWithClientInfo); ok {
+			info := ci.GetClientInfo()
+			clientName = info.Name
+			clientVersion = info.Version
+		}
+		log.Printf("session connected: id=%s depth=%d client=%s/%s", sid, depth, clientName, clientVersion)
+		b.registerSession(sid, clientName, clientVersion, depth)
+
+		// Request roots from root sessions to discover CWD.
+		if depth > 0 {
+			return
+		}
+		go func() {
+			// Brief delay to ensure the session is fully initialized.
+			time.Sleep(500 * time.Millisecond)
+			rootsCtx := mcpSrv.WithContext(context.Background(), session)
+			result, err := mcpSrv.RequestRoots(rootsCtx, mcp.ListRootsRequest{})
+			if err != nil {
+				log.Printf("session %s: RequestRoots: %v", sid, err)
+				return
+			}
+			if len(result.Roots) > 0 {
+				uri := result.Roots[0].URI
+				// Convert file:// URI to path.
+				if parsed, err := url.Parse(uri); err == nil && parsed.Scheme == "file" {
+					cwd := parsed.Path
+					log.Printf("session %s: roots → cwd=%s", sid, cwd)
+					b.updateSessionCWD(sid, cwd)
+				} else {
+					log.Printf("session %s: roots URI not file://: %s", sid, uri)
+				}
+			}
+		}()
+	})
+	hooks.AddOnUnregisterSession(func(ctx context.Context, session server.ClientSession) {
+		sid := session.SessionID()
+		log.Printf("session disconnected: id=%s", sid)
+		b.disconnectSession(sid)
+	})
 
 	mcpSrv.AddTool(
 		mcp.NewTool("cwork",
@@ -904,11 +1558,30 @@ func serve(port int) {
 		b.handleCwork,
 	)
 
-	transport := server.NewStreamableHTTPServer(mcpSrv)
+	// Inject depth from URL query string into context for each request.
+	transport := server.NewStreamableHTTPServer(mcpSrv,
+		server.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
+			q := r.URL.Query()
+			if d := q.Get("depth"); d != "" {
+				if n, err := strconv.Atoi(d); err == nil {
+					ctx = context.WithValue(ctx, depthKey, n)
+				}
+			}
+			if wid := q.Get("wid"); wid != "" {
+				ctx = context.WithValue(ctx, parentIDKey, wid)
+			}
+			return ctx
+		}),
+	)
 
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", transport)
 	mux.HandleFunc("/status", b.handleStatus)
+	mux.HandleFunc("/dashboard", b.handleDashboard)
+	mux.HandleFunc("/api/sessions", b.handleAPISessions)
+	mux.HandleFunc("/api/workers", b.handleAPIWorkers)
+	mux.HandleFunc("/api/workers/{id}/events", b.handleWorkerEvents)
+	mux.HandleFunc("/api/events", b.handleSSE)
 
 	httpSrv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
@@ -928,7 +1601,7 @@ func serve(port int) {
 		log.Fatalf("serve: %v", err)
 	}
 
-	b.pool.drain()
+	b.shutdown()
 }
 
 // --- Status CLI ---

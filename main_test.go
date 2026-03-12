@@ -18,11 +18,11 @@ import (
 // --- Pool tests ---
 
 func TestPoolTakeAndPut(t *testing.T) {
-	p := newPool()
+	p := newPool(1)
 	w := &workerProc{cwd: "/proj", model: "sonnet"}
 	p.put(w)
 
-	got := p.take("/proj", "sonnet")
+	got := p.take("/proj", "sonnet", 0)
 	if got != w {
 		t.Fatal("take should return the put worker")
 	}
@@ -32,11 +32,11 @@ func TestPoolTakeAndPut(t *testing.T) {
 }
 
 func TestPoolTakeNoMatch(t *testing.T) {
-	p := newPool()
+	p := newPool(1)
 	w := &workerProc{cwd: "/proj", model: "sonnet"}
 	p.put(w)
 
-	got := p.take("/proj", "opus")
+	got := p.take("/proj", "opus", 0)
 	if got != nil {
 		t.Fatal("take('opus') should return nil when only sonnet is available")
 	}
@@ -46,13 +46,13 @@ func TestPoolTakeNoMatch(t *testing.T) {
 }
 
 func TestPoolTakeCwdIsolation(t *testing.T) {
-	p := newPool()
+	p := newPool(1)
 	wA := &workerProc{cwd: "/projA", model: "sonnet"}
 	wB := &workerProc{cwd: "/projB", model: "sonnet"}
 	p.put(wA)
 	p.put(wB)
 
-	got := p.take("/projA", "sonnet")
+	got := p.take("/projA", "sonnet", 0)
 	if got != wA {
 		t.Fatal("take should return projA's worker")
 	}
@@ -60,14 +60,14 @@ func TestPoolTakeCwdIsolation(t *testing.T) {
 		t.Fatalf("pool should have 1 worker, got %d", p.count())
 	}
 
-	got = p.take("/projA", "sonnet")
+	got = p.take("/projA", "sonnet", 0)
 	if got != nil {
 		t.Fatal("take from projA should return nil when only projB remains")
 	}
 }
 
 func TestPoolCounts(t *testing.T) {
-	p := newPool()
+	p := newPool(2)
 	p.put(&workerProc{cwd: "/proj", model: "opus"})
 	p.put(&workerProc{cwd: "/proj", model: "opus"})
 	p.put(&workerProc{cwd: "/proj", model: "sonnet"})
@@ -86,8 +86,20 @@ func TestPoolCounts(t *testing.T) {
 	}
 }
 
+func TestPoolCapEnforced(t *testing.T) {
+	p := newPool(1)
+	w1 := &workerProc{cwd: "/proj", model: "sonnet"}
+	w2 := &workerProc{cwd: "/proj", model: "sonnet"}
+	p.put(w1)
+	p.put(w2) // should be discarded
+
+	if p.count() != 1 {
+		t.Fatalf("pool should cap at 1, got %d", p.count())
+	}
+}
+
 func TestPoolDrain(t *testing.T) {
-	p := newPool()
+	p := newPool(1)
 	p.put(&workerProc{cwd: "/proj", model: "sonnet"})
 	p.put(&workerProc{cwd: "/proj", model: "opus"})
 	p.drain()
@@ -407,8 +419,10 @@ func TestDiscoverTranscriptNoProjectDir(t *testing.T) {
 
 func TestStatusEndpoint(t *testing.T) {
 	b := &broker{
-		pool: newPool(),
-		reg:  newShadowRegistry(),
+		pool:     newPool(1),
+		reg:      newShadowRegistry(),
+		active:   make(map[*workerProc]struct{}),
+		eventHub: newEventHub(),
 	}
 
 	b.pool.put(&workerProc{cwd: "/proj", model: "sonnet"})
