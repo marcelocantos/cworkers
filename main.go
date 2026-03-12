@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -293,6 +294,59 @@ func processLine(line []byte, s *shadow) {
 	s.add(fmt.Sprintf("[%s]: %s", role, text))
 }
 
+// --- Progress Throttle ---
+
+// progressThrottle controls which worker output lines get forwarded as
+// MCP progress notifications. Headings are tiered by depth:
+//
+//	tier 0 (#)    — always forwarded immediately
+//	tier 1 (##)   — at most once per 10s
+//	tier 2 (###+) — suppressed (never forwarded)
+//
+// Non-heading text is suppressed entirely.
+type progressThrottle struct {
+	lastSent [2]time.Time // tiers 0 and 1 only; tier 2 is always suppressed
+	intervals [2]time.Duration
+}
+
+func newProgressThrottle() *progressThrottle {
+	return &progressThrottle{
+		intervals: [2]time.Duration{0, 10 * time.Second},
+	}
+}
+
+// headingTier returns the tier (0, 1, 2) for a heading line, or -1 if
+// the line is not a heading.
+func headingTier(line string) int {
+	if !strings.HasPrefix(line, "#") {
+		return -1
+	}
+	if strings.HasPrefix(line, "### ") {
+		return 2
+	}
+	if strings.HasPrefix(line, "## ") {
+		return 1
+	}
+	if strings.HasPrefix(line, "# ") {
+		return 0
+	}
+	return -1
+}
+
+// shouldForward returns true if the heading at the given tier should be
+// forwarded now, and updates the last-sent timestamp.
+func (t *progressThrottle) shouldForward(tier int) bool {
+	if tier < 0 || tier >= 2 {
+		return false // non-heading or tier 2+ suppressed
+	}
+	now := time.Now()
+	if now.Sub(t.lastSent[tier]) < t.intervals[tier] {
+		return false
+	}
+	t.lastSent[tier] = now
+	return true
+}
+
 // --- Worker Process ---
 
 // workerProc represents a pre-spawned claude -p process waiting for
@@ -373,7 +427,9 @@ func spawnWorker(cwd, model string) (*workerProc, error) {
 }
 
 // dispatch sends a prompt to the worker and blocks until it returns a result.
-func (w *workerProc) dispatch(prompt string) (string, error) {
+// The onText callback is called with each new text fragment as it arrives from
+// the worker's assistant output, enabling real-time progress reporting.
+func (w *workerProc) dispatch(prompt string, onText func(string)) (string, error) {
 	// Write prompt and close stdin to signal EOF.
 	if _, err := io.WriteString(w.stdin, prompt); err != nil {
 		w.cancel()
@@ -419,6 +475,9 @@ func (w *workerProc) dispatch(prompt string) (string, error) {
 				for _, b := range msg.Message.Content {
 					if b.Type == "text" && b.Text != "" {
 						textParts = append(textParts, b.Text)
+						if onText != nil {
+							onText(b.Text)
+						}
 					}
 				}
 			}
@@ -652,23 +711,63 @@ func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		log.Printf("pre-warmed %s worker for %s (pool: %d)", model, s.cwd, b.pool.count())
 	}()
 
-	// Dispatch in a goroutine so we can send progress heartbeats.
+	// Set up content-driven progress notifications.
+	progressToken := req.Params.Meta.ProgressToken
+	mcpSrv := server.ServerFromContext(ctx)
+	throttle := newProgressThrottle()
+	start := time.Now()
+
+	sendProgress := func(msg string) {
+		if mcpSrv == nil {
+			return
+		}
+		elapsed := int(time.Since(start).Seconds())
+		if progressToken != nil {
+			_ = mcpSrv.SendNotificationToClient(ctx, "notifications/progress", map[string]any{
+				"progressToken": progressToken,
+				"progress":      elapsed,
+				"total":         0,
+				"message":       msg,
+			})
+		}
+		_ = mcpSrv.SendNotificationToClient(ctx, "notifications/message", map[string]any{
+			"level": "info",
+			"data":  fmt.Sprintf("cwork: %s", msg),
+		})
+	}
+
+	// Track last activity to send fallback heartbeats during silent periods.
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixMilli())
+
+	// onText is called by dispatch for each assistant text fragment.
+	// Extract heading lines and forward them through the throttle.
+	onText := func(text string) {
+		lastActivity.Store(time.Now().UnixMilli())
+		for _, line := range strings.Split(text, "\n") {
+			line = strings.TrimSpace(line)
+			tier := headingTier(line)
+			if tier >= 0 && throttle.shouldForward(tier) {
+				sendProgress(line)
+			}
+		}
+	}
+
+	// Dispatch in a goroutine so we can handle cancellation and heartbeats.
 	type dispatchResult struct {
 		text string
 		err  error
 	}
 	done := make(chan dispatchResult, 1)
 	go func() {
-		result, err := w.dispatch(prompt)
+		result, err := w.dispatch(prompt, onText)
 		done <- dispatchResult{result, err}
 	}()
 
-	// Send progress notifications every 20s to keep the connection alive.
-	progressToken := req.Params.Meta.ProgressToken
-	mcpSrv := server.ServerFromContext(ctx)
-	ticker := time.NewTicker(20 * time.Second)
+	// Fallback heartbeat: if no content-driven progress for 30s, send
+	// an elapsed-time notification to keep the connection alive.
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-	start := time.Now()
 
 	var result dispatchResult
 	for {
@@ -676,22 +775,10 @@ func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		case result = <-done:
 			goto finished
 		case <-ticker.C:
-			elapsed := int(time.Since(start).Seconds())
-			if mcpSrv != nil && progressToken != nil {
-				_ = mcpSrv.SendNotificationToClient(ctx, "notifications/progress", map[string]any{
-					"progressToken": progressToken,
-					"progress":      elapsed,
-					"total":         0,
-					"message":       fmt.Sprintf("Worker running (%ds)...", elapsed),
-				})
-			}
-			// Also send a log notification as fallback for clients
-			// that don't handle progress tokens.
-			if mcpSrv != nil {
-				_ = mcpSrv.SendNotificationToClient(ctx, "notifications/message", map[string]any{
-					"level": "info",
-					"data":  fmt.Sprintf("cwork: worker still running (%ds elapsed)", elapsed),
-				})
+			lastMs := lastActivity.Load()
+			if time.Since(time.UnixMilli(lastMs)) >= 30*time.Second {
+				sendProgress(fmt.Sprintf("Worker running (%ds)...", int(time.Since(start).Seconds())))
+				lastActivity.Store(time.Now().UnixMilli())
 			}
 		case <-ctx.Done():
 			w.kill()
