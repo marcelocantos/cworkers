@@ -44,6 +44,27 @@ The `model` parameter on `cwork` controls which model the worker uses.
 When in doubt, use sonnet. Reserve opus for tasks that genuinely need deeper
 reasoning.
 
+## Parallelism
+
+**Workers are extremely cheap to start.** The broker pre-warms the pool — after
+each dispatch, a replacement worker is spawned so the next task starts instantly.
+Leverage this aggressively:
+
+- **Fan out independent work.** If you need to read 3 files, search for 2
+  patterns, and run a build — fire all of them as parallel `cwork` calls
+  rather than sequencing them. Each one is a separate worker with its own
+  context window.
+- **Don't batch into a single worker** what could be separate parallel tasks.
+  A worker that reads a file, then searches, then builds is slower than three
+  workers doing each concurrently. Split along natural boundaries.
+- **Research fan-out.** When investigating a problem, dispatch multiple workers
+  to explore different hypotheses or codepaths simultaneously.
+- **Bulk changes.** When applying a pattern across N files, dispatch one worker
+  per file (or per small group) rather than one worker for all files.
+
+The only reason to sequence `cwork` calls is when a later task depends on the
+result of an earlier one.
+
 ## Tips
 
 - **Context is the bottleneck.** The whole point of delegating is to keep the
@@ -54,9 +75,4 @@ reasoning.
 - Workers see your recent conversation context via shadow mode. You don't need
   to repeat background information in the task — just describe what to do.
 - Each `cwork` call is synchronous: it blocks until the worker completes and
-  returns the result.
-- The broker pre-warms the pool — after each dispatch, a replacement worker is
-  spawned so the next dispatch is instant.
-- For burst parallelism (many concurrent tasks), use regular Agent spawning
-  rather than `cwork`. The pool is optimised for steady-state sequential
-  dispatches.
+  returns the result. Use multiple parallel calls to avoid idle waiting.

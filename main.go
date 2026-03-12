@@ -1333,9 +1333,9 @@ finished:
 		setupHint = `
 
 ---
-SETUP NOTE: For best results, ensure the project's CLAUDE.md contains a
-cworkers directive near the top. If it doesn't have one, suggest adding
-this to the user:
+SETUP NOTE: For best results, ensure CLAUDE.md (global or project)
+contains a cworkers directive near the top. If it doesn't have one,
+suggest adding this to the user:
 
 ` + "```" + `
 ## cworkers
@@ -1345,6 +1345,11 @@ file reads, or searches directly in the root session. Always delegate
 via the ` + "`cwork`" + ` MCP tool. The only exceptions are trivial git commands
 (git status, git diff) whose output you already know will be small.
 When in doubt, delegate.
+
+Workers start instantly (pre-warmed pool). Parallelise aggressively —
+if tasks are independent, fire them as concurrent cwork calls rather
+than sequencing. Don't batch unrelated work into one worker when
+separate parallel workers would be faster.
 ` + "```"
 	})
 
@@ -1443,6 +1448,45 @@ func (b *broker) handleWorkerEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(list)
+}
+
+func handleHome(w http.ResponseWriter, _ *http.Request) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	io.WriteString(w, home)
+}
+
+func handleOpenFile(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path string `json:"path"`
+		Line int    `json:"line,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Path == "" {
+		http.Error(w, "path required", http.StatusBadRequest)
+		return
+	}
+	// Validate path is absolute and exists.
+	if !filepath.IsAbs(req.Path) {
+		http.Error(w, "path must be absolute", http.StatusBadRequest)
+		return
+	}
+	if _, err := os.Stat(req.Path); err != nil {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+	if err := exec.Command("open", req.Path).Run(); err != nil {
+		http.Error(w, "open failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (b *broker) handleSSE(w http.ResponseWriter, r *http.Request) {
@@ -1582,6 +1626,8 @@ func serve(port int) {
 	mux.HandleFunc("/api/workers", b.handleAPIWorkers)
 	mux.HandleFunc("/api/workers/{id}/events", b.handleWorkerEvents)
 	mux.HandleFunc("/api/events", b.handleSSE)
+	mux.HandleFunc("POST /api/open", handleOpenFile)
+	mux.HandleFunc("GET /api/home", handleHome)
 
 	httpSrv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),

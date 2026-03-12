@@ -20,6 +20,7 @@ class WorkerState {
   collapsedSessions = $state(new Set());
   /** @type {Array} */
   selectedEvents = $state([]);
+  eventsLoaded = $state(false);
 
   /** @type {EventSource|null} */
   #evtSource = null;
@@ -91,6 +92,7 @@ class WorkerState {
   selectWorker(id) {
     this.selectedID = id;
     this.selectedEvents = [];
+    this.eventsLoaded = !id;
 
     this.#updateURL();
     if (id) {
@@ -252,9 +254,11 @@ class WorkerState {
       // Only apply if still the selected worker.
       if (this.selectedID === id) {
         this.selectedEvents = events || [];
+        this.eventsLoaded = true;
       }
     } catch (e) {
       console.error('loadWorkerEvents:', e);
+      this.eventsLoaded = true;
     }
   }
 
