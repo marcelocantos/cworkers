@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-cworkers is a task broker for Claude Code agent sessions. It pre-spawns idle worker agents that receive tasks instantly via a Unix domain socket, with multi-session shadow mode — each session registers its own JSONL transcript, and dispatches select which session's context to inject. Single Go binary, zero external dependencies.
+cworkers is a task broker for Claude Code agent sessions. It runs as an MCP server that pre-spawns idle `claude -p` worker processes and dispatches tasks to them instantly. Shadow mode auto-discovers the calling session's JSONL transcript and injects recent conversation context into workers. Single Go binary.
 
-Subcommands: `serve`, `worker`, `dispatch`, `shadow`, `unshadow`, `status`. See `DESIGN.md` for the full architecture, protocol spec, and known limitations.
+Subcommands: `serve` (MCP daemon on port 4242), `status` (pool/shadow query). See `DESIGN.md` for the full architecture and known limitations.
 
 ## Build & Test
 
@@ -26,13 +26,12 @@ go test -run TestE2EWorkerReceivesTask ./...
 
 Everything lives in a single `main.go` with `main_test.go` for tests. Key components:
 
-- **shadowRegistry** — Maps session IDs to shadow instances. Each shadow tails a JSONL transcript file and maintains a rolling window of recent user/assistant messages (thread-safe). Sessions register/unregister via the SHADOW/UNSHADOW protocol commands.
-- **shadow** — Tails a single transcript, maintains rolling message window. Has a `done` channel for clean shutdown on unregister.
-- **pool** — Thread-safe worker pool with model-tagged connections and a dispatch queue (waiters). When no worker matches a dispatch, the request queues with a timeout; arriving workers check queued dispatches before entering the pool.
-- **Protocol** — Line-based text over Unix socket: `WORKER <model> <session>`, `DISPATCH <model> <session>\n<task>`, `SHADOW <session-id> <transcript-path> [context-lines]`, `UNSHADOW <session-id>`, `STATUS [session-id]`. Workers are session-scoped — the broker only routes dispatches to workers from the same session. Workers hold the connection open until a task arrives or timeout.
-- **Worker reconnect loop** — `worker` command loops internally with 60s reconnect intervals within a single bash tool call (capped at 590s default). No agent-level looping required.
-
-Socket path defaults to `/tmp/cworkers-<uid>.sock`.
+- **MCP server** — Streamable HTTP on `/mcp` (via mcp-go library). Single tool: `cwork(task, cwd, model?)`.
+- **shadowRegistry** — Maps cwds to shadow instances. Each shadow tails a JSONL transcript file and maintains a rolling window of recent user/assistant messages (thread-safe). Auto-registers on first `cwork` call per cwd.
+- **shadow** — Tails a single transcript, maintains rolling message window. Has a `done` channel for clean shutdown.
+- **pool** — Thread-safe worker pool keyed by `cwd + model`. Pre-warming: each dispatch spawns a replacement worker in the background.
+- **workerProc** — A pre-spawned `claude -p` process. Receives prompt on stdin, produces NDJSON on stdout. Broker parses stream-json output for result text.
+- **Progress heartbeats** — Sends `notifications/progress` and `notifications/message` every 20s during dispatch to prevent MCP client timeout.
 
 ## Delivery
 
