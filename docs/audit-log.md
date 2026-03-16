@@ -55,3 +55,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `f9a130a`
 - **Outcome**: Released v0.10.0 (darwin-arm64, linux-amd64, linux-arm64). Fixed cold-pool bootstrapping: delegation decisions no longer gated on pool status. Dispatch-first flow with Agent fallback. Homebrew formula updated.
+
+## 2026-03-16 — /release v0.11.0
+
+- **Commit**: `1d543eb`
+- **Outcome**: Released v0.11.0 (darwin-arm64, linux-amd64, linux-arm64). MCP server rewrite replacing Unix socket CLI protocol. Added Svelte dashboard, SQLite persistence, shadow auto-discovery, depth-controlled worker hierarchies, SSE live events. Updated README, STABILITY.md, and CI/release workflows for Node.js dashboard build. Homebrew formula updated.
