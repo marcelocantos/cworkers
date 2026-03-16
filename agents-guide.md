@@ -13,7 +13,7 @@ The broker runs as an MCP server on port 4242 by default.
 
 ## 2. Configure MCP
 
-Add to your project's `.mcp.json` (or `~/.claude/.mcp.json` for global):
+Add to your project's `.mcp.json` (or `~/.claude.json` for global):
 
 ```json
 {
