@@ -41,7 +41,18 @@ via the `cwork` MCP tool. The only exceptions are trivial git commands
 When in doubt, delegate.
 ```
 
-## 4. Start using it
+## 4. Configure claude path (optional)
+
+If the `claude` binary isn't on `PATH` (e.g., when running as a brew service),
+create `~/.config/cworkers/config.json`:
+
+```json
+{
+  "claude_path": "/Users/you/.local/bin/claude"
+}
+```
+
+## 5. Start using it
 
 The `cwork` MCP tool is now available. Call it with a `task` and your
 `cwd` (working directory). The broker auto-discovers your transcript

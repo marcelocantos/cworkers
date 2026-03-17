@@ -375,6 +375,9 @@ type workerProc struct {
 
 const maxDepth = 3
 
+// claudePath is the resolved path to the claude binary. Set at startup.
+var claudePath = "claude"
+
 // spawnFunc is the function used to create workers. Replaced in tests.
 var spawnFunc = spawnWorker
 
@@ -403,7 +406,7 @@ func spawnWorker(cwd, model string, port, depth int, wid string) (*workerProc, e
 		args = append(args, "--mcp-config", mcpCfg)
 	}
 
-	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd := exec.CommandContext(ctx, claudePath, args...)
 	cmd.Dir = cwd
 	// Unset CLAUDECODE to avoid nested session detection.
 	cmd.Env = filterEnv(os.Environ(), "CLAUDECODE")
@@ -1519,11 +1522,33 @@ func (b *broker) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 // --- Serve ---
 
+// loadConfig reads ~/.config/cworkers/config.json and applies settings.
+func loadConfig(homeDir string) {
+	data, err := os.ReadFile(filepath.Join(homeDir, ".config", "cworkers", "config.json"))
+	if err != nil {
+		return // no config file is fine
+	}
+	var cfg struct {
+		ClaudePath string `json:"claude_path"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		log.Printf("warning: invalid config.json: %v", err)
+		return
+	}
+	if cfg.ClaudePath != "" {
+		claudePath = cfg.ClaudePath
+		log.Printf("claude path: %s (from config)", claudePath)
+	}
+}
+
 func serve(port int) {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		log.Fatalf("home dir: %v", err)
 	}
+
+	loadConfig(homeDir)
+
 	dbPath := filepath.Join(homeDir, ".local", "share", "cworkers", "cworkers.db")
 	db, err := initDB(dbPath)
 	if err != nil {
