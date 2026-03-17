@@ -89,6 +89,8 @@ func main() {
 		serve(port)
 	case "status":
 		statusCmd(port)
+	case "work":
+		workCmd(port)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
 		printUsage(os.Stderr)
@@ -103,6 +105,7 @@ commands:
   serve      Start the MCP broker daemon
                --port <N>    HTTP port (default: %d)
   status     Show pool state
+  work       Stdio MCP frontend (connects to running daemon)
 
 global flags:
   --port <N>     HTTP port (default: %d)
@@ -758,14 +761,18 @@ func (b *broker) shutdown() {
 	b.mu.Unlock()
 }
 
-func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	args := req.GetArguments()
-	task, _ := args["task"].(string)
-	cwd, _ := args["cwd"].(string)
-	model, _ := args["model"].(string)
-	depth := depthFromContext(ctx)
-	parentWID := parentIDFromContext(ctx)
+// dispatchCallbacks holds caller-provided hooks invoked during task dispatch.
+// onProgress is called with human-readable progress messages (headings, heartbeats).
+// onDone is called (if non-nil) when dispatch completes, before the result is returned.
+type dispatchCallbacks struct {
+	onProgress func(msg string)
+	onDone     func()
+}
 
+// dispatchTask is the shared dispatch core used by both handleCwork (MCP) and
+// handleDispatch (HTTP). It spawns a worker, drives it, logs events, and calls
+// cb.onProgress for each progress update. Returns the result text or an error.
+func (b *broker) dispatchTask(ctx context.Context, task, cwd, model, sessionID, parentWID string, depth int, cb dispatchCallbacks) (string, error) {
 	// Build hierarchical display name: w1, w1.1, w1.1.2, etc.
 	seq := b.nextDisplayID()
 	var displayName string
@@ -780,23 +787,7 @@ func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp
 
 	if depth >= maxDepth {
 		log.Printf("[%s] rejected: max depth %d reached", displayName, maxDepth)
-		return mcp.NewToolResultError(fmt.Sprintf("cwork rejected: maximum delegation depth (%d) reached — do the work directly", maxDepth)), nil
-	}
-
-	if task == "" {
-		return mcp.NewToolResultError("missing required parameter: task"), nil
-	}
-	if cwd == "" {
-		return mcp.NewToolResultError("missing required parameter: cwd"), nil
-	}
-	if model == "" {
-		model = "sonnet"
-	}
-
-	// Extract MCP session ID for linking workers to sessions.
-	var sessionID string
-	if cs := server.ClientSessionFromContext(ctx); cs != nil {
-		sessionID = cs.SessionID()
+		return "", fmt.Errorf("cwork rejected: maximum delegation depth (%d) reached — do the work directly", maxDepth)
 	}
 
 	log.Printf("[%s] cwork request: depth=%d model=%s cwd=%s session=%s task=%.100s", displayName, depth, model, cwd, sessionID, task)
@@ -820,46 +811,16 @@ func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	log.Printf("[%s] spawning %s worker", displayName, model)
 	w, err := spawnFunc(cwd, model, b.port, depth, displayName)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("spawn worker: %v", err)), nil
+		b.finishWorker(id, "error")
+		return "", fmt.Errorf("spawn worker: %v", err)
 	}
 
-
-	// Set up content-driven progress notifications.
-	progressToken := req.Params.Meta.ProgressToken
-	mcpSrv := server.ServerFromContext(ctx)
 	throttle := newProgressThrottle()
 	start := time.Now()
 
 	sendProgress := func(msg string) {
-		if mcpSrv == nil {
-			log.Printf("sendProgress: no MCP server in context")
-			return
-		}
-		if debug {
-			log.Printf("sendProgress: msg=%q progressToken=%v", msg, progressToken)
-		}
-		elapsed := int(time.Since(start).Seconds())
-		if progressToken != nil {
-			err := mcpSrv.SendNotificationToClient(ctx, "notifications/progress", map[string]any{
-				"progressToken": progressToken,
-				"progress":      elapsed,
-				"total":         0,
-				"message":       msg,
-			})
-			if err != nil {
-				log.Printf("sendProgress (progress): %v", err)
-			} else if debug {
-				log.Printf("sendProgress (progress): sent OK")
-			}
-		}
-		err := mcpSrv.SendNotificationToClient(ctx, "notifications/message", map[string]any{
-			"level": "info",
-			"data":  fmt.Sprintf("cwork: %s", msg),
-		})
-		if err != nil {
-			log.Printf("sendProgress (message): %v", err)
-		} else if debug {
-			log.Printf("sendProgress (message): sent OK")
+		if cb.onProgress != nil {
+			cb.onProgress(msg)
 		}
 	}
 
@@ -959,19 +920,171 @@ func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp
 			b.untrackWorker(w)
 			b.finishWorker(id, "error")
 			w.kill()
-			return mcp.NewToolResultError("request cancelled"), nil
+			return "", fmt.Errorf("request cancelled")
 		}
 	}
 
 finished:
 	b.untrackWorker(w)
+	if cb.onDone != nil {
+		cb.onDone()
+	}
 	if result.err != nil {
 		b.finishWorker(id, "error")
-		return mcp.NewToolResultError(fmt.Sprintf("worker error: %v", result.err)), nil
+		return "", fmt.Errorf("worker error: %v", result.err)
 	}
 	b.finishWorker(id, "done")
+	return result.text, nil
+}
 
-	return mcp.NewToolResultText(result.text), nil
+func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	task, _ := args["task"].(string)
+	cwd, _ := args["cwd"].(string)
+	model, _ := args["model"].(string)
+	depth := depthFromContext(ctx)
+	parentWID := parentIDFromContext(ctx)
+
+	if task == "" {
+		return mcp.NewToolResultError("missing required parameter: task"), nil
+	}
+	if cwd == "" {
+		return mcp.NewToolResultError("missing required parameter: cwd"), nil
+	}
+	if model == "" {
+		model = "sonnet"
+	}
+
+	// Extract MCP session ID for linking workers to sessions.
+	var sessionID string
+	if cs := server.ClientSessionFromContext(ctx); cs != nil {
+		sessionID = cs.SessionID()
+	}
+
+	// Set up content-driven progress notifications via MCP.
+	progressToken := req.Params.Meta.ProgressToken
+	mcpSrv := server.ServerFromContext(ctx)
+	start := time.Now()
+
+	sendMCPProgress := func(msg string) {
+		if mcpSrv == nil {
+			log.Printf("sendProgress: no MCP server in context")
+			return
+		}
+		if debug {
+			log.Printf("sendProgress: msg=%q progressToken=%v", msg, progressToken)
+		}
+		elapsed := int(time.Since(start).Seconds())
+		if progressToken != nil {
+			err := mcpSrv.SendNotificationToClient(ctx, "notifications/progress", map[string]any{
+				"progressToken": progressToken,
+				"progress":      elapsed,
+				"total":         0,
+				"message":       msg,
+			})
+			if err != nil {
+				log.Printf("sendProgress (progress): %v", err)
+			} else if debug {
+				log.Printf("sendProgress (progress): sent OK")
+			}
+		}
+		err := mcpSrv.SendNotificationToClient(ctx, "notifications/message", map[string]any{
+			"level": "info",
+			"data":  fmt.Sprintf("cwork: %s", msg),
+		})
+		if err != nil {
+			log.Printf("sendProgress (message): %v", err)
+		} else if debug {
+			log.Printf("sendProgress (message): sent OK")
+		}
+	}
+
+	cb := dispatchCallbacks{onProgress: sendMCPProgress}
+	text, err := b.dispatchTask(ctx, task, cwd, model, sessionID, parentWID, depth, cb)
+	if err != nil {
+		if err.Error() == "request cancelled" {
+			return mcp.NewToolResultError("request cancelled"), nil
+		}
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	return mcp.NewToolResultText(text), nil
+}
+
+// dispatchRequest is the JSON body accepted by POST /api/dispatch.
+type dispatchRequest struct {
+	Task  string `json:"task"`
+	CWD   string `json:"cwd"`
+	Model string `json:"model"`
+	Depth int    `json:"depth"`
+	WID   string `json:"wid"`
+}
+
+// dispatchEvent is one NDJSON frame written by handleDispatch.
+type dispatchEvent struct {
+	Type    string `json:"type"`
+	Message string `json:"message,omitempty"`
+	Text    string `json:"text,omitempty"`
+}
+
+func writeNDJSON(w io.Writer, ev dispatchEvent) error {
+	data, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "%s\n", data)
+	return err
+}
+
+func (b *broker) handleDispatch(w http.ResponseWriter, r *http.Request) {
+	var dreq dispatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&dreq); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if dreq.Task == "" {
+		http.Error(w, "missing required field: task", http.StatusBadRequest)
+		return
+	}
+	if dreq.CWD == "" {
+		http.Error(w, "missing required field: cwd", http.StatusBadRequest)
+		return
+	}
+	if dreq.Model == "" {
+		dreq.Model = "sonnet"
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	var mu sync.Mutex
+	flush := func(ev dispatchEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		writeNDJSON(w, ev) //nolint:errcheck
+		flusher.Flush()
+	}
+
+	cb := dispatchCallbacks{
+		onProgress: func(msg string) {
+			flush(dispatchEvent{Type: "progress", Message: msg})
+		},
+	}
+
+	text, err := b.dispatchTask(r.Context(), dreq.Task, dreq.CWD, dreq.Model, "", dreq.WID, dreq.Depth, cb)
+	if err != nil {
+		flush(dispatchEvent{Type: "error", Message: err.Error()})
+		return
+	}
+	flush(dispatchEvent{Type: "result", Text: text})
 }
 
 // --- HTTP Status ---
@@ -1273,6 +1386,7 @@ func serve(port int) {
 	mux.HandleFunc("/api/events", b.handleSSE)
 	mux.HandleFunc("POST /api/open", handleOpenFile)
 	mux.HandleFunc("GET /api/home", handleHome)
+	mux.HandleFunc("POST /api/dispatch", b.handleDispatch)
 
 	httpSrv := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
@@ -1293,6 +1407,136 @@ func serve(port int) {
 	}
 
 	b.shutdown()
+}
+
+// --- Work (stdio MCP frontend) ---
+
+// workCmd runs a stdio MCP server that proxies cwork calls to the daemon's
+// /api/dispatch endpoint. This lets clients connect via stdio MCP transport
+// while the actual work is performed by the running daemon.
+func workCmd(port int) {
+	log.SetOutput(os.Stderr) // must not write to stdout (MCP transport)
+
+	mcpSrv := server.NewMCPServer("cworkers-work", version,
+		server.WithInstructions(agentGuide),
+	)
+
+	baseURL := fmt.Sprintf("http://localhost:%d", port)
+	// Use an HTTP client with no timeout — dispatches can run for minutes.
+	httpClient := &http.Client{}
+
+	mcpSrv.AddTool(
+		mcp.NewTool("cwork",
+			mcp.WithDescription("Dispatch a task to a worker agent. Returns the worker's result."),
+			mcp.WithString("task", mcp.Required(), mcp.Description("The task prompt for the worker")),
+			mcp.WithString("cwd", mcp.Required(), mcp.Description("Working directory of the calling session")),
+			mcp.WithString("model", mcp.Description("Model to use (default: sonnet). Options: sonnet, opus, haiku")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			args := req.GetArguments()
+			task, _ := args["task"].(string)
+			cwd, _ := args["cwd"].(string)
+			model, _ := args["model"].(string)
+			depth := depthFromContext(ctx)
+			parentWID := parentIDFromContext(ctx)
+
+			if task == "" {
+				return mcp.NewToolResultError("missing required parameter: task"), nil
+			}
+			if cwd == "" {
+				return mcp.NewToolResultError("missing required parameter: cwd"), nil
+			}
+			if model == "" {
+				model = "sonnet"
+			}
+
+			dreq := dispatchRequest{
+				Task:  task,
+				CWD:   cwd,
+				Model: model,
+				Depth: depth,
+				WID:   parentWID,
+			}
+			body, err := json.Marshal(dreq)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("marshal request: %v", err)), nil
+			}
+
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/dispatch", strings.NewReader(string(body)))
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("build request: %v", err)), nil
+			}
+			httpReq.Header.Set("Content-Type", "application/json")
+
+			resp, err := httpClient.Do(httpReq)
+			if err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("dispatch request: %v", err)), nil
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				msg, _ := io.ReadAll(resp.Body)
+				return mcp.NewToolResultError(fmt.Sprintf("daemon error (%d): %s", resp.StatusCode, strings.TrimSpace(string(msg)))), nil
+			}
+
+			// Set up MCP progress notifications.
+			progressToken := req.Params.Meta.ProgressToken
+			mcpServer := server.ServerFromContext(ctx)
+			start := time.Now()
+
+			sendProgress := func(msg string) {
+				if mcpServer == nil {
+					return
+				}
+				elapsed := int(time.Since(start).Seconds())
+				if progressToken != nil {
+					_ = mcpServer.SendNotificationToClient(ctx, "notifications/progress", map[string]any{
+						"progressToken": progressToken,
+						"progress":      elapsed,
+						"total":         0,
+						"message":       msg,
+					})
+				}
+				_ = mcpServer.SendNotificationToClient(ctx, "notifications/message", map[string]any{
+					"level": "info",
+					"data":  fmt.Sprintf("cwork: %s", msg),
+				})
+			}
+
+			// Read streaming NDJSON response from daemon.
+			scanner := bufio.NewScanner(resp.Body)
+			scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+			for scanner.Scan() {
+				line := scanner.Bytes()
+				if len(line) == 0 {
+					continue
+				}
+				var ev dispatchEvent
+				if err := json.Unmarshal(line, &ev); err != nil {
+					log.Printf("work: unparseable event: %.100s", line)
+					continue
+				}
+				switch ev.Type {
+				case "progress":
+					sendProgress(ev.Message)
+				case "result":
+					return mcp.NewToolResultText(ev.Text), nil
+				case "error":
+					return mcp.NewToolResultError(ev.Message), nil
+				default:
+					log.Printf("work: unknown event type: %s", ev.Type)
+				}
+			}
+			if err := scanner.Err(); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("read response: %v", err)), nil
+			}
+			return mcp.NewToolResultError("daemon closed connection without result"), nil
+		},
+	)
+
+	if err := server.ServeStdio(mcpSrv); err != nil {
+		log.Fatalf("work: ServeStdio: %v", err)
+	}
 }
 
 // --- Status CLI ---
