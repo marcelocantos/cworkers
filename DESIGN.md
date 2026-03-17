@@ -101,7 +101,7 @@ agent needing to summarize or repeat anything.
 
 ### Transcript Discovery
 
-The encoded cwd path replaces `/` and `.` with `-` and prepends `-`,
+The encoded cwd path replaces `/`, `.`, and `_` with `-` and prepends `-`,
 matching Claude Code's project directory naming convention. The broker
 scans for `.jsonl` files and selects the most recently modified one.
 

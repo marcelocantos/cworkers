@@ -242,7 +242,7 @@ refinement.
 
 Given a CWD, the broker encodes it as:
 ```
-"-" + strings.NewReplacer("/", "-", ".", "-").Replace(cwd[1:])
+"-" + strings.NewReplacer("/", "-", ".", "-", "_", "-").Replace(cwd[1:])
 ```
 and scans `~/.claude/projects/<encoded>/` for `.jsonl` files, selecting
 the most recently modified one.

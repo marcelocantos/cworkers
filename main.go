@@ -673,8 +673,8 @@ func discoverTranscript(cwd string) (string, error) {
 		return "", fmt.Errorf("home dir: %w", err)
 	}
 
-	// Claude Code encodes the cwd by replacing "/" and "." with "-" and prepending "-".
-	encoded := "-" + strings.NewReplacer("/", "-", ".", "-").Replace(cwd[1:])
+	// Claude Code encodes the cwd by replacing "/", ".", and "_" with "-" and prepending "-".
+	encoded := "-" + strings.NewReplacer("/", "-", ".", "-", "_", "-").Replace(cwd[1:])
 	projectDir := filepath.Join(home, ".claude", "projects", encoded)
 
 	entries, err := os.ReadDir(projectDir)
@@ -947,14 +947,13 @@ func (h *eventHub) sendWorkerEvent(workerID string, data []byte) {
 // --- MCP Broker ---
 
 type broker struct {
-	pool   *pool
-	reg    *shadowRegistry
-	port   int
-	db     *sql.DB
-	mu     sync.Mutex
-	active map[*workerProc]struct{}
-	nextID atomic.Int64
-
+	pool         *pool
+	reg          *shadowRegistry
+	port         int
+	db           *sql.DB
+	mu           sync.Mutex
+	active       map[*workerProc]struct{}
+	nextID       atomic.Int64
 	eventHub *eventHub
 }
 
@@ -1597,7 +1596,7 @@ func serve(port int) {
 			mcp.WithDescription("Dispatch a task to a worker agent. Returns the worker's result."),
 			mcp.WithString("task", mcp.Required(), mcp.Description("The task prompt for the worker")),
 			mcp.WithString("cwd", mcp.Required(), mcp.Description("Working directory of the calling session")),
-			mcp.WithString("model", mcp.Description("Model to use (default: sonnet). Options: sonnet, opus")),
+			mcp.WithString("model", mcp.Description("Model to use (default: sonnet). Options: sonnet, opus, haiku")),
 		),
 		b.handleCwork,
 	)

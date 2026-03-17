@@ -40,6 +40,8 @@ The `model` parameter on `cwork` controls which model the worker uses.
   tests, running builds, triaging errors, anything with clear structure.
 - **opus** — Complex reasoning, architectural decisions, novel problem-solving,
   deep code analysis, tasks where getting it right matters more than speed.
+- **haiku** — Fast and lightweight. Good for simple lookups, mechanical
+  find-and-replace, running builds/tests, and triaging output.
 
 When in doubt, use sonnet. Reserve opus for tasks that genuinely need deeper
 reasoning.
