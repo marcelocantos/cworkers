@@ -225,10 +225,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     // Header.
     let active = app.workers.values().filter(|w| w.status == Status::Active).count();
     let total = app.workers.len();
-    let mode = if app.show_all { "all" } else { "active" };
     let header = Line::from(vec![
         Span::styled(" cdash ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(format!("| {} active / {} total [{}]", active, total, mode)),
+        Span::raw(format!("| {} active / {} total", active, total)),
     ]);
     frame.render_widget(Paragraph::new(header), outer[0]);
 
@@ -308,13 +307,22 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Footer.
+    let (active_style, all_style) = if app.show_all {
+        (Style::default().fg(Color::DarkGray), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+    } else {
+        (Style::default().fg(Color::White).add_modifier(Modifier::BOLD), Style::default().fg(Color::DarkGray))
+    };
     let footer = Line::from(vec![
         Span::styled(" q", Style::default().fg(Color::Yellow)),
         Span::raw(" quit  "),
         Span::styled("↑↓", Style::default().fg(Color::Yellow)),
         Span::raw(" select  "),
-        Span::styled("tab", Style::default().fg(Color::Yellow)),
-        Span::raw(" active/all  "),
+        Span::styled("a", Style::default().fg(Color::Yellow)),
+        Span::raw(" "),
+        Span::styled("active", active_style),
+        Span::raw("/"),
+        Span::styled("all", all_style),
+        Span::raw("  "),
         Span::styled("pgup/pgdn", Style::default().fg(Color::Yellow)),
         Span::raw(" scroll"),
     ]);
