@@ -5,6 +5,7 @@
 // Spawns claude -p workers directly. Logs lifecycle to activity.jsonl,
 // detail to per-worker files. 35KB binary, zero SQLite.
 
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/uio.h>
@@ -288,20 +289,18 @@ static void handle_cwork(const char *raw_id, size_t id_len,
     zcopyn(id_copy, sizeof(id_copy), raw_id, id_len);
     if (id_copy_len >= sizeof(id_copy)) id_copy_len = sizeof(id_copy) - 1;
 
-    // Generate globally unique worker ID: w<epoch_us> (microseconds).
-    char display_name[32];
+    // Generate globally unique worker ID: w<8 random base36 chars>.
+    char display_name[12]; // w + 8 chars + \0
     {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        unsigned long long us = (unsigned long long)ts.tv_sec * 1000000
-                              + (unsigned long long)ts.tv_nsec / 1000;
-        char tmp[24];
-        int i = (int)sizeof(tmp);
-        while (us > 0) { tmp[--i] = (char)('0' + us % 10); us /= 10; }
-        tmp[--i] = 'w';
-        int dlen = (int)sizeof(tmp) - i;
-        memcpy(display_name, tmp + i, (size_t)dlen);
-        display_name[dlen] = '\0';
+        static const char b36[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+        unsigned char rnd[8];
+        int ufd = open("/dev/urandom", O_RDONLY);
+        if (ufd >= 0) { read(ufd, rnd, sizeof(rnd)); close(ufd); }
+        else memset(rnd, 0, sizeof(rnd));
+        display_name[0] = 'w';
+        for (int i = 0; i < 8; i++)
+            display_name[1 + i] = b36[rnd[i] % 36];
+        display_name[9] = '\0';
     }
 
     // Open per-worker log.
