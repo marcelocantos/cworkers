@@ -137,7 +137,6 @@ int worker_run(const char *claude_path,
     argv[argc++] = "--verbose";
     argv[argc++] = "--output-format";
     argv[argc++] = "stream-json";
-    argv[argc++] = "--dangerously-skip-permissions";
     if (model && model[0]) {
         argv[argc++] = "--model";
         argv[argc++] = model;
