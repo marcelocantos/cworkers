@@ -60,6 +60,7 @@ void jb_str(jbuf_t *b, const char *s);      // quoted + escaped
 void jb_strn(jbuf_t *b, const char *s, size_t n);
 void jb_int(jbuf_t *b, int v);
 void jb_bool(jbuf_t *b, int v);
+void jb_raw_str(jbuf_t *b, const char *s, size_t n);  // "s" (pre-escaped)
 void jb_key(jbuf_t *b, const char *k);      // "k":
 
 // Bind buffer to an output fd. Enables auto-flush when buffer fills.

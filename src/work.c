@@ -68,21 +68,23 @@ static void emit_response_head(const char *raw_id, size_t id_len) {
     jb_ch(&out, ',');
 }
 
+// raw=1: text is pre-escaped JSON string content. raw=0: plain C string.
 static void emit_tool_result(const char *raw_id, size_t id_len,
                              const char *text, size_t text_len,
-                             int is_error) {
+                             int is_error, int raw) {
     emit_response_head(raw_id, id_len);
     jb_lit(&out, "\"result\":{");
     if (is_error) jb_lit(&out, "\"isError\":true,");
     jb_lit(&out, "\"content\":[{\"type\":\"text\",\"text\":");
-    jb_strn(&out, text, text_len);
+    if (raw) jb_raw_str(&out, text, text_len);
+    else     jb_strn(&out, text, text_len);
     jb_lit(&out, "}]}}");
     emit_flush();
 }
 
 static void emit_tool_error(const char *raw_id, size_t id_len,
                             const char *msg) {
-    emit_tool_result(raw_id, id_len, msg, strlen(msg), 1);
+    emit_tool_result(raw_id, id_len, msg, strlen(msg), 1, 0);
 }
 
 static void emit_progress(const char *msg, size_t msg_len) {
@@ -137,8 +139,9 @@ static void log_activity(int afd, const char *worker_id, const char *event,
 }
 
 // Write to per-worker file (detail events).
+// raw=1: data is already JSON-escaped (from json_str). raw=0: plain string.
 static void log_detail(int wfd, const char *event,
-                       const char *data, size_t data_len) {
+                       const char *data, size_t data_len, int raw) {
     jb_reset(&logbuf);
     jb_ch(&logbuf, '{');
     jb_key(&logbuf, "ts"); emit_timestamp(&logbuf);
@@ -146,7 +149,9 @@ static void log_detail(int wfd, const char *event,
     jb_key(&logbuf, "event"); jb_str(&logbuf, event);
     if (data && data_len > 0) {
         jb_ch(&logbuf, ',');
-        jb_key(&logbuf, "data"); jb_strn(&logbuf, data, data_len);
+        jb_key(&logbuf, "data");
+        if (raw) jb_raw_str(&logbuf, data, data_len);
+        else     jb_strn(&logbuf, data, data_len);
     }
     jb_ch(&logbuf, '}');
     log_write(wfd, logbuf.data, logbuf.len);
@@ -203,7 +208,7 @@ static void on_worker_event(enum worker_event ev,
         if (len > 0 && (data[0] == '#' ||
                        (len > 1 && data[0] == '*' && data[1] == '*'))) {
             emit_progress(data, len);
-            log_detail(ctx->worker_fd, "progress", data, len);
+            log_detail(ctx->worker_fd, "progress", data, len, 1);
         }
         break;
     case WE_TOOL_USE: {
@@ -213,18 +218,18 @@ static void on_worker_event(enum worker_event ev,
         memcpy(msg + mlen, data, copy);
         mlen += copy;
         emit_progress(msg, mlen);
-        log_detail(ctx->worker_fd, "tool_use", data, len);
+        log_detail(ctx->worker_fd, "tool_use", data, len, 1);
         break;
     }
     case WE_RESULT:
-        emit_tool_result(ctx->raw_id, ctx->id_len, data, len, 0);
-        log_detail(ctx->worker_fd, "result", data, len);
+        emit_tool_result(ctx->raw_id, ctx->id_len, data, len, 0, 1);
+        log_detail(ctx->worker_fd, "result", data, len, 1);
         log_activity(ctx->activity_fd, ctx->worker_id, "done", NULL, NULL);
         ctx->got_result = 1;
         break;
     case WE_ERROR:
-        emit_tool_result(ctx->raw_id, ctx->id_len, data, len, 1);
-        log_detail(ctx->worker_fd, "error", data, len);
+        emit_tool_result(ctx->raw_id, ctx->id_len, data, len, 1, 1);
+        log_detail(ctx->worker_fd, "error", data, len, 1);
         log_activity(ctx->activity_fd, ctx->worker_id, "error", NULL, NULL);
         ctx->got_result = 1;
         break;
@@ -314,7 +319,7 @@ static void handle_cwork(const char *raw_id, size_t id_len,
     int worker_fd = log_worker_open(display_name);
 
     // Log start: full task in worker file, summary in activity.
-    log_detail(worker_fd, "task", task_z, task_len);
+    log_detail(worker_fd, "task", task_z, task_len, 1);
     log_activity(activity_fd, display_name, "start", "model", model_z);
 
     // Build prompt as iovecs.

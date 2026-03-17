@@ -212,6 +212,12 @@ void jb_bool(jbuf_t *b, int v) {
     else   jb_raw(b, "false", 5);
 }
 
+void jb_raw_str(jbuf_t *b, const char *s, size_t n) {
+    jb_ch(b, '"');
+    jb_raw(b, s, n);
+    jb_ch(b, '"');
+}
+
 void jb_key(jbuf_t *b, const char *k) {
     jb_str(b, k);
     jb_ch(b, ':');
