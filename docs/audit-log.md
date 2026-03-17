@@ -65,3 +65,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `32d0ca0`
 - **Outcome**: Released v0.12.0 (darwin-arm64, linux-amd64, linux-arm64). Fixed transcript discovery for paths with underscores. Added haiku model option. Upgraded Node.js to 24 LTS in CI. Homebrew formula updated.
+
+## 2026-03-17 — /release v0.13.0
+
+- **Commit**: `15a469e`
+- **Outcome**: Released v0.13.0 (darwin-arm64, linux-amd64, linux-arm64). Added config file support (~/.config/cworkers/config.json) for claude binary path. Upgraded GitHub Actions to v6 (Node.js 22 runtime). Homebrew formula updated.

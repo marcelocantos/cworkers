@@ -10,7 +10,7 @@ get these right.
 
 ## Interaction Surface Catalogue
 
-Snapshot as of v0.12.0.
+Snapshot as of v0.13.0.
 
 ### CLI Subcommands
 
@@ -28,6 +28,14 @@ Snapshot as of v0.12.0.
 | `--help-agent` | global | bool | — | Stable |
 | `--port <N>` | global | int | `4242` | Stable |
 | `--debug` | global | bool | false | Needs review — internal/diagnostic; may be removed or gated. |
+
+### Configuration File
+
+`~/.config/cworkers/config.json` — optional, read at startup.
+
+| Field | Type | Default | Stability |
+|---|---|---|---|
+| `claude_path` | string | `"claude"` (PATH lookup) | Needs review — new in v0.13.0. |
 
 ### MCP Tool: `cwork`
 
