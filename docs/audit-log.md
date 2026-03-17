@@ -75,3 +75,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `57bebea`
 - **Outcome**: Released v0.14.0 (darwin-arm64, linux-amd64, linux-arm64). Major simplification: removed shadow context system, worker pool, and transcript discovery. Broker is now a stateless MCP-to-CLI bridge with SQLite observability. Added db_path config option. Updated all documentation. Homebrew formula updated.
+
+## 2026-03-17 — /release v0.15.0
+
+- **Commit**: `d7a5cfb`
+- **Outcome**: Released v0.15.0 (darwin-arm64, linux-amd64, linux-arm64). Added stdio MCP frontend (`cworkers work`) and HTTP dispatch API (`POST /api/dispatch`). Both stdio and HTTP MCP modes now supported. Dashboard transcript cleanup. Homebrew formula updated.

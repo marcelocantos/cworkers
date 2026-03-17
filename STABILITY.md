@@ -10,7 +10,7 @@ get these right.
 
 ## Interaction Surface Catalogue
 
-Snapshot as of v0.14.0.
+Snapshot as of v0.15.0.
 
 ### CLI Subcommands
 
