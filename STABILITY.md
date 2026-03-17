@@ -10,7 +10,7 @@ get these right.
 
 ## Interaction Surface Catalogue
 
-Snapshot as of v0.13.0.
+Snapshot as of v0.14.0.
 
 ### CLI Subcommands
 
@@ -72,7 +72,7 @@ All endpoints are served on `http://localhost:<port>/`.
 | Endpoint | Method | Description | Stability |
 |---|---|---|---|
 | `/mcp` | GET/POST | MCP Streamable HTTP transport | Stable |
-| `/status` | GET | JSON pool/shadow summary | Stable — see response shape below. |
+| `/status` | GET | JSON active worker count | Stable — see response shape below. |
 | `/dashboard` | GET | Svelte dashboard (single-file HTML) | Needs review — UI evolving. |
 | `/api/sessions` | GET | JSON array of session rows | Needs review — fields may grow. |
 | `/api/workers` | GET | JSON array of worker rows | Needs review — fields may grow. |
@@ -84,7 +84,7 @@ All endpoints are served on `http://localhost:<port>/`.
 #### `/status` Response Shape
 
 ```json
-{ "workers": N, "models": { "<model>": N, ... }, "shadows": N }
+{ "active_workers": N }
 ```
 
 Stability: **Stable** for existing fields; new fields may be added.
@@ -199,7 +199,7 @@ part of the external surface from v1.0.
 ### Context Injection Format
 
 When a worker receives a task, its stdin prompt is assembled from up to
-three parts (in order, each separated by a blank line):
+two parts (in order, each separated by a blank line):
 
 1. **Delegation policy block** (depth ≥ 1 only):
    ```
@@ -208,31 +208,16 @@ three parts (in order, each separated by a blank line):
    === END POLICY ===
    ```
 
-2. **Shadow context block** (when context is available):
-   ```
-   === CONVERSATION CONTEXT (recent messages from root session) ===
-   [User]: ...
-   [Assistant]: ...
-   === END CONTEXT ===
-   ```
-
-3. **Task**:
+2. **Task**:
    ```
    TASK: <task body>
    ```
 
+Workers start fresh — there is no conversation context injected from the
+parent session. Callers must include all relevant context in the task body.
+
 Stability: **Needs review** — block headers and format may change as
-shadow mode and delegation policy mature.
-
-### Shadow Context Window
-
-50 lines (user + assistant message text), rolling. Each message is
-formatted as `[User]: ...` or `[Assistant]: ...`. Transcript tailed with
-a 500 ms poll interval; context is a best-effort snapshot.
-
-Stability: **Needs review** — window size and poll interval are
-compile-time constants, not configurable. May become configurable before
-1.0.
+delegation policy matures.
 
 ### MCP Session Hooks
 
@@ -246,39 +231,21 @@ Stability: **Needs review** — the roots-based CWD discovery is a
 heuristic; root selection (first root URI → strip `file://`) may need
 refinement.
 
-### Transcript Discovery
-
-Given a CWD, the broker encodes it as:
-```
-"-" + strings.NewReplacer("/", "-", ".", "-", "_", "-").Replace(cwd[1:])
-```
-and scans `~/.claude/projects/<encoded>/` for `.jsonl` files, selecting
-the most recently modified one.
-
-Stability: **Needs review** — depends on Claude Code's undocumented
-project directory naming convention, which could change.
-
 ### Worker Process Invocation
 
-Workers are spawned as:
+Workers are spawned on demand as:
 ```
 claude -p --verbose --output-format stream-json --dangerously-skip-permissions
        [--model <model>]
        [--mcp-config <json>]   # omitted at maxDepth
 ```
 with `stdin` open (prompt written then closed), `stdout` captured as
-NDJSON, working directory set to the requested `cwd`.
+NDJSON, working directory set to the requested `cwd`. There is no pool
+or pre-warming — each `cwork` call spawns a fresh process.
 
 Stability: **Needs review** — depends on the `claude` CLI's stable flags.
 `--dangerously-skip-permissions` is required but is an unstable upstream
 flag name.
-
-### Pool Key
-
-Workers are pooled by `cwd + "\x00" + model + "\x00" + depth`. Pre-warming
-spawns one replacement after each dispatch. Maximum idle per key: 1.
-
-Stability: **Internal** — not externally observable.
 
 ### Display Names
 
@@ -290,43 +257,28 @@ Stability: **Needs review** — format is visible in logs, dashboard, and
 
 ## Gaps and Prerequisites for 1.0
 
-1. **Shadow context window is not configurable** — The 50-line rolling
-   window is a compile-time constant. Projects with verbose conversations
-   may want a larger window; resource-constrained setups may want smaller.
-   Consider a `--context-lines` flag on `serve`.
-
-2. **Task acknowledgment / retry** — Once the broker writes the prompt to
+1. **Task acknowledgment / retry** — Once the broker writes the prompt to
    a worker's stdin, failure is silent. No retry or dead-letter mechanism.
    Acceptable for v0.x; needs a decision before 1.0.
 
-3. **Single transcript per cwd** — If two Claude Code sessions are active
-   in the same project directory simultaneously, only the most recently
-   modified transcript is tailed. A race window exists; the correct shadow
-   is not guaranteed.
-
-4. **Transcript discovery depends on undocumented Claude Code convention**
-   — The project directory encoding (`/` → `-`) is reverse-engineered from
-   Claude Code's behaviour. Changes upstream would silently break shadow
-   mode.
-
-5. **Port-based, not socket-based** — Port 4242 is shared across all users
+2. **Port-based, not socket-based** — Port 4242 is shared across all users
    on the host. Multiple users need different ports; no per-user isolation.
    Pre-1.0, document the multi-user configuration or switch to a per-user
    socket/port convention.
 
-6. **Test coverage** — Core dispatch paths are covered. Edge cases
-   (concurrent shadow registration, large transcripts, malformed NDJSON,
-   SSE client reconnect, DB migration idempotency) need additional tests.
+3. **Test coverage** — Core dispatch paths are covered. Edge cases
+   (large task prompts, malformed NDJSON, SSE client reconnect, DB migration
+   idempotency) need additional tests.
 
-7. **Schema stability signal** — SQLite schema is observable but has no
+4. **Schema stability signal** — SQLite schema is observable but has no
    version number. Add a `schema_version` pragma or a `meta` table before
    1.0 so external tools can gate on it.
 
-8. **`--dangerously-skip-permissions` dependency** — Workers require this
+5. **`--dangerously-skip-permissions` dependency** — Workers require this
    flag. If the upstream `claude` CLI renames or removes it, spawning
    breaks silently. Should be validated at startup.
 
-9. **`wid` URL parameter** — Used to propagate the parent display name for
+6. **`wid` URL parameter** — Used to propagate the parent display name for
    child worker naming. The parameter is internal but visible in the
    synthesised `--mcp-config` JSON that workers receive. Its encoding is
    not validated.
@@ -343,3 +295,5 @@ Stability: **Needs review** — format is visible in logs, dashboard, and
 - **Dashboard persistence beyond current run** — The dashboard shows
   SQLite data from the current and prior runs (DB is not wiped on start),
   but historical replay, search, and export are not planned for 1.0.
+- **Context injection** — Workers start fresh. Conversation context
+  forwarding is the caller's responsibility via the task description.

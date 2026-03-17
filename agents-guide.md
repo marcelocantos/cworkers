@@ -55,6 +55,5 @@ create `~/.config/cworkers/config.json`:
 ## 5. Start using it
 
 The `cwork` MCP tool is now available. Call it with a `task` and your
-`cwd` (working directory). The broker auto-discovers your transcript
-and injects conversation context into workers. See `cworkers --help-agent`
-for the full operational guide.
+`cwd` (working directory). Workers start fresh — include all necessary context in the task description.
+See `cworkers --help-agent` for the full operational guide.

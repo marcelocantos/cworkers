@@ -1,8 +1,8 @@
 # cworkers — Task Delegation via MCP
 
-cworkers is a task broker that delegates work to worker agents. Workers are
-pre-spawned `claude -p` processes managed by the broker — dispatched tasks
-start instantly with no startup overhead.
+cworkers is a task broker that delegates work to worker agents. Each `cwork`
+call spawns a fresh `claude -p` process, waits for its output, and returns
+the result.
 
 ## Usage
 
@@ -63,9 +63,9 @@ reasoning.
 
 ## Parallelism
 
-**Workers are extremely cheap to start.** The broker pre-warms the pool — after
-each dispatch, a replacement worker is spawned so the next task starts instantly.
-Leverage this aggressively:
+**Parallel workers are cheap.** Each `cwork` call is independent — fire
+multiple calls at once and they all run concurrently. Leverage this
+aggressively:
 
 - **Fan out independent work.** If you need to read 3 files, search for 2
   patterns, and run a build — fire all of them as parallel `cwork` calls

@@ -70,3 +70,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `15a469e`
 - **Outcome**: Released v0.13.0 (darwin-arm64, linux-amd64, linux-arm64). Added config file support (~/.config/cworkers/config.json) for claude binary path. Upgraded GitHub Actions to v6 (Node.js 22 runtime). Homebrew formula updated.
+
+## 2026-03-17 — /release v0.14.0
+
+- **Commit**: `57bebea`
+- **Outcome**: Released v0.14.0 (darwin-arm64, linux-amd64, linux-arm64). Major simplification: removed shadow context system, worker pool, and transcript discovery. Broker is now a stateless MCP-to-CLI bridge with SQLite observability. Added db_path config option. Updated all documentation. Homebrew formula updated.
