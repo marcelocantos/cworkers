@@ -42,16 +42,23 @@ static char **build_env(const char **env_extra) {
 typedef struct {
     worker_event_fn event_fn;
     void *ctx;
-    volatile int stop;
+    pthread_mutex_t mu;
+    pthread_cond_t cond;
+    int stop;
 } heartbeat_ctx_t;
 
 static void *heartbeat_thread(void *arg) {
     heartbeat_ctx_t *hb = arg;
+    pthread_mutex_lock(&hb->mu);
     while (!hb->stop) {
-        sleep(HEARTBEAT_INTERVAL_SEC);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += HEARTBEAT_INTERVAL_SEC;
+        pthread_cond_timedwait(&hb->cond, &hb->mu, &ts);
         if (hb->stop) break;
         hb->event_fn(WE_HEARTBEAT, NULL, 0, hb->ctx);
     }
+    pthread_mutex_unlock(&hb->mu);
     return NULL;
 }
 
@@ -225,7 +232,12 @@ int worker_run(const char *claude_path,
     }
 
     // Start heartbeat thread.
-    heartbeat_ctx_t hb = { .event_fn = event_fn, .ctx = ctx, .stop = 0 };
+    heartbeat_ctx_t hb = {
+        .event_fn = event_fn, .ctx = ctx,
+        .mu = PTHREAD_MUTEX_INITIALIZER,
+        .cond = PTHREAD_COND_INITIALIZER,
+        .stop = 0,
+    };
     pthread_t hb_thread;
     pthread_create(&hb_thread, NULL, heartbeat_thread, &hb);
 
@@ -257,9 +269,14 @@ int worker_run(const char *claude_path,
 
     close(pipe_out[0]);
 
-    // Stop heartbeat thread.
+    // Stop heartbeat thread (wakes immediately via condvar).
+    pthread_mutex_lock(&hb.mu);
     hb.stop = 1;
+    pthread_cond_signal(&hb.cond);
+    pthread_mutex_unlock(&hb.mu);
     pthread_join(hb_thread, NULL);
+    pthread_mutex_destroy(&hb.mu);
+    pthread_cond_destroy(&hb.cond);
 
     int status;
     waitpid(pid, &status, 0);
