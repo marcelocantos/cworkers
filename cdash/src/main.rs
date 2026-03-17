@@ -270,20 +270,21 @@ fn draw(frame: &mut Frame, app: &mut App) {
                 _ => ("    ", Color::DarkGray),
             };
             if let Some(data) = &ev.data {
-                // Wrap long lines by splitting manually.
-                let prefix = format!("{} ", label);
-                let first_line = format!("{}{}", prefix, data);
-                for (i, chunk) in first_line.as_bytes().chunks(main[1].width as usize).enumerate() {
-                    let text = String::from_utf8_lossy(chunk);
-                    if i == 0 {
-                        lines.push(Line::from(vec![
-                            Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
-                            Span::raw(" "),
-                            Span::raw(data.clone()),
-                        ]));
-                    } else {
-                        lines.push(Line::from(Span::raw(format!("     {}", text))));
-                    }
+                // For result/error, render as markdown.
+                if ev.event == "result" || ev.event == "error" {
+                    lines.push(Line::from(Span::styled(
+                        label,
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    )));
+                    let md = tui_markdown::from_str(data);
+                    lines.extend(md.lines.into_iter());
+                    lines.push(Line::from(""));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                        Span::raw(" "),
+                        Span::raw(data.clone()),
+                    ]));
                 }
             } else {
                 lines.push(Line::from(Span::styled(label, Style::default().fg(color))));
