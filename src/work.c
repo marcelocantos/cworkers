@@ -380,6 +380,11 @@ int work_main(void) {
         } else if (method_len == 10 && memcmp(method, "tools/call", 10) == 0) {
             if (msg.vals[2])
                 handle_cwork(raw_id, id_len, msg.vals[2], msg.lens[2], log_fd);
+        } else if (raw_id) {
+            // Unknown method with id — return JSON-RPC error.
+            emit_response_head(raw_id, id_len);
+            jb_lit(&out, "\"error\":{\"code\":-32601,\"message\":\"method not found\"}}");
+            emit_flush();
         }
     }
 
