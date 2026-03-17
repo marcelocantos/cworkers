@@ -76,11 +76,10 @@ out=$(echo '{"jsonrpc":"2.0","method":"notifications/initialized"}' | $CWORK 2>/
 check "notification: no response" "" "$out"
 
 # --- multi-message sequence ---
-out=$(printf '%s\n%s\n' \
+lines=$(printf '%s\n%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
     '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
-    | $CWORK 2>/dev/null)
-lines=$(echo "$out" | wc -l | tr -d ' ')
+    | $CWORK 2>/dev/null | wc -l | tr -d ' ')
 check "multi-message: two responses" "2" "$lines"
 
 # --- tools/call: actual dispatch (requires claude on PATH) ---
@@ -101,14 +100,14 @@ if command -v claude >/dev/null 2>&1; then
         FAIL=$((FAIL + 1))
         echo "FAIL: dispatch: activity log not created at $actlog"
     fi
-    # Check per-worker log.
-    wlog="$HOME/.local/share/cworkers/workers/w1.jsonl"
-    if [ -f "$wlog" ]; then
+    # Check per-worker log (ID is random, find the latest).
+    wlog=$(ls -t "$HOME/.local/share/cworkers/workers/"*.jsonl 2>/dev/null | head -1)
+    if [ -n "$wlog" ]; then
         check "dispatch: worker task" "task" "$(cat "$wlog")"
         check "dispatch: worker result" "result" "$(cat "$wlog")"
     else
         FAIL=$((FAIL + 1))
-        echo "FAIL: dispatch: worker log not created at $wlog"
+        echo "FAIL: dispatch: no worker log files found"
     fi
 else
     echo "SKIP: dispatch tests (claude not on PATH)"

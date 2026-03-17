@@ -140,19 +140,31 @@ void jb_init(jbuf_t *b, char *storage, size_t cap) {
     b->data = storage;
     b->len = 0;
     b->cap = cap;
+    b->fd = -1;
 }
+
+void jb_bind(jbuf_t *b, int fd) { b->fd = fd; }
 
 void jb_reset(jbuf_t *b) { b->len = 0; }
 
 void jb_ch(jbuf_t *b, char c) {
+    if (b->len >= b->cap && b->fd >= 0) jb_flush(b);
     if (b->len < b->cap) b->data[b->len++] = c;
 }
 
 void jb_raw(jbuf_t *b, const char *s, size_t n) {
-    size_t avail = b->cap - b->len;
-    size_t w = n < avail ? n : avail;
-    memcpy(b->data + b->len, s, w);
-    b->len += w;
+    while (n > 0) {
+        size_t avail = b->cap - b->len;
+        if (avail == 0 && b->fd >= 0) {
+            jb_flush(b);
+            avail = b->cap;
+        }
+        size_t w = n < avail ? n : avail;
+        memcpy(b->data + b->len, s, w);
+        b->len += w;
+        s += w;
+        n -= w;
+    }
 }
 
 void jb_lit(jbuf_t *b, const char *s) { jb_raw(b, s, strlen(s)); }
@@ -205,14 +217,21 @@ void jb_key(jbuf_t *b, const char *k) {
     jb_ch(b, ':');
 }
 
-int jb_flush(jbuf_t *b, int fd) {
+int jb_flush(jbuf_t *b) {
+    if (b->fd < 0 || b->len == 0) return 0;
     size_t off = 0;
     while (off < b->len) {
-        ssize_t n = write(fd, b->data + off, b->len - off);
+        ssize_t n = write(b->fd, b->data + off, b->len - off);
         if (n <= 0) return -1;
         off += (size_t)n;
     }
+    b->len = 0;
+    return 0;
+}
+
+int jb_flush_line(jbuf_t *b) {
+    if (jb_flush(b) < 0) return -1;
     char nl = '\n';
-    if (write(fd, &nl, 1) != 1) return -1;
+    if (write(b->fd, &nl, 1) != 1) return -1;
     return 0;
 }

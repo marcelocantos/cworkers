@@ -48,6 +48,7 @@ typedef struct {
     char  *data;
     size_t len;
     size_t cap;
+    int    fd;   // bound output fd, or -1
 } jbuf_t;
 
 void jb_init(jbuf_t *b, char *storage, size_t cap);
@@ -61,8 +62,15 @@ void jb_int(jbuf_t *b, int v);
 void jb_bool(jbuf_t *b, int v);
 void jb_key(jbuf_t *b, const char *k);      // "k":
 
-// Write buffer + newline to fd. Returns 0 on success, -1 on error.
-int jb_flush(jbuf_t *b, int fd);
+// Bind buffer to an output fd. Enables auto-flush when buffer fills.
+void jb_bind(jbuf_t *b, int fd);
+
+// Flush buffer contents to bound fd. Resets buffer position.
+// Returns 0 on success, -1 on error.
+int jb_flush(jbuf_t *b);
+
+// Flush buffer + newline to bound fd. For JSON-RPC line termination.
+int jb_flush_line(jbuf_t *b);
 
 // --- Utility ---
 

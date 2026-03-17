@@ -13,6 +13,10 @@
 #include <unistd.h>
 
 #include "json.h"
+
+// Embedded help-agent.md (linked via .incbin in help_agent.s).
+extern const char help_agent_data[];
+extern const unsigned long long help_agent_size;
 #include "log.h"
 #include "worker.h"
 
@@ -54,8 +58,7 @@ static ssize_t read_line(void) {
 // --- Emit helpers (JSON-RPC to stdout) ---
 
 static void emit_flush(void) {
-    jb_flush(&out, STDOUT_FILENO);
-    jb_reset(&out);
+    jb_flush_line(&out);
 }
 
 static void emit_response_head(const char *raw_id, size_t id_len) {
@@ -354,8 +357,9 @@ static void emit_initialize(const char *raw_id, size_t id_len) {
             "\"protocolVersion\":\"2025-03-26\","
             "\"serverInfo\":{\"name\":\"cworkers\",\"version\":\"" CWORKERS_VERSION "\"},"
             "\"capabilities\":{\"tools\":{}},"
-            "\"instructions\":\"Workers start fresh with no conversation context. "
-            "Include all necessary context in the task description.\"}}");
+            "\"instructions\":");
+    jb_strn(&out, help_agent_data, (size_t)help_agent_size);
+    jb_lit(&out, "}}");
     emit_flush();
 }
 
@@ -382,6 +386,7 @@ static void emit_tools_list(const char *raw_id, size_t id_len) {
 
 int work_main(void) {
     jb_init(&out, out_storage, OUT_CAP);
+    jb_bind(&out, STDOUT_FILENO);
     jb_init(&logbuf, log_storage, LOG_CAP);
 
     int activity_fd = log_activity_open();
