@@ -362,7 +362,8 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, rx: mpsc::Receiver<()>) ->
                 }
             }
         } else {
-            mark_stale(&mut app.workers);
+            // Timeout — poll for changes and refresh stale markers.
+            app.refresh();
         }
     }
 }
@@ -370,6 +371,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, rx: mpsc::Receiver<()>) ->
 fn main() -> io::Result<()> {
     let (tx, rx) = mpsc::channel();
     let dir = data_dir();
+    let activity_path = dir.join("activity.jsonl");
 
     let mut watcher = recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
         if let Ok(ev) = res {
@@ -379,7 +381,7 @@ fn main() -> io::Result<()> {
         }
     }).expect("file watcher");
 
-    let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
+    let _ = watcher.watch(&activity_path, RecursiveMode::NonRecursive);
 
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
