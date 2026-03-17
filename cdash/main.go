@@ -132,7 +132,7 @@ func readWorkerLog(id string) []detailEvent {
 
 var (
 	sidebarStyle = lipgloss.NewStyle().
-			Width(8).
+			Width(7).
 			BorderRight(true).
 			BorderStyle(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.Color("240"))
@@ -317,7 +317,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		contentWidth := m.width - 10 // sidebar + border
+		contentWidth := m.width - 9 // sidebar + border
 		if contentWidth < 20 {
 			contentWidth = 20
 		}
