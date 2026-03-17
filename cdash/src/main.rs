@@ -323,44 +323,55 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App, rx: mpsc::Receiver<()>) -> io::Result<()> {
     loop {
-        app.refresh();
         terminal.draw(|frame| draw(frame, app))?;
 
-        if event::poll(Duration::from_secs(1))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press { continue; }
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        app.list_state.select_previous();
-                        app.transcript_scroll = 0;
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        app.list_state.select_next();
-                        app.transcript_scroll = 0;
-                    }
-                    KeyCode::Char('a') => {
-                        app.show_all = !app.show_all;
-                        let ids = app.visible_ids();
-                        if ids.is_empty() {
-                            app.list_state.select(None);
-                        } else {
-                            app.list_state.select(Some(0));
+        // Wait for either a file change or a key event.
+        loop {
+            // Drain file watcher notifications.
+            let mut refreshed = false;
+            while rx.try_recv().is_ok() {
+                refreshed = true;
+            }
+            if refreshed {
+                app.refresh();
+                break; // redraw
+            }
+
+            // Poll for key events with short timeout to interleave with rx.
+            if event::poll(Duration::from_millis(100))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind != KeyEventKind::Press { continue; }
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.list_state.select_previous();
+                            app.transcript_scroll = 0;
                         }
-                        app.transcript_scroll = 0;
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            app.list_state.select_next();
+                            app.transcript_scroll = 0;
+                        }
+                        KeyCode::Char('a') => {
+                            app.show_all = !app.show_all;
+                            let ids = app.visible_ids();
+                            if ids.is_empty() {
+                                app.list_state.select(None);
+                            } else {
+                                app.list_state.select(Some(0));
+                            }
+                            app.transcript_scroll = 0;
+                        }
+                        KeyCode::PageDown => {
+                            app.transcript_scroll = app.transcript_scroll.saturating_add(10);
+                        }
+                        KeyCode::PageUp => {
+                            app.transcript_scroll = app.transcript_scroll.saturating_sub(10);
+                        }
+                        _ => {}
                     }
-                    KeyCode::PageDown => {
-                        app.transcript_scroll = app.transcript_scroll.saturating_add(10);
-                    }
-                    KeyCode::PageUp => {
-                        app.transcript_scroll = app.transcript_scroll.saturating_sub(10);
-                    }
-                    _ => {}
+                    break; // redraw
                 }
             }
-        } else {
-            // Timeout — poll for changes and refresh stale markers.
-            app.refresh();
         }
     }
 }
