@@ -10,7 +10,7 @@ get these right.
 
 ## Interaction Surface Catalogue
 
-Snapshot as of v0.11.0.
+Snapshot as of v0.12.0.
 
 ### CLI Subcommands
 
@@ -37,7 +37,7 @@ Delivered via Streamable HTTP at `http://localhost:<port>/mcp`.
 |---|---|---|---|---|
 | `task` | string | yes | — | Stable |
 | `cwd` | string | yes | — | Stable |
-| `model` | string | no | `"sonnet"` | Stable — values: `sonnet`, `opus`. |
+| `model` | string | no | `"sonnet"` | Stable — values: `sonnet`, `opus`, `haiku`. |
 
 Return value: tool result string containing the worker's output text, or
 a tool error if the worker failed or max depth was exceeded.
@@ -105,7 +105,7 @@ Stability: **Stable** for existing fields; new fields may be added.
   "parent_id": "<display-name>",      // omitted if root worker
   "display_name": "w1.2.3",
   "cwd": "...",
-  "model": "sonnet|opus",
+  "model": "sonnet|opus|haiku",
   "task": "...",
   "status": "running|done|error",
   "started_at": "<RFC3339Nano>",

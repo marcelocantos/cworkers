@@ -60,3 +60,8 @@ maintenance activities. Append-only — newest entries at the bottom.
 
 - **Commit**: `1d543eb`
 - **Outcome**: Released v0.11.0 (darwin-arm64, linux-amd64, linux-arm64). MCP server rewrite replacing Unix socket CLI protocol. Added Svelte dashboard, SQLite persistence, shadow auto-discovery, depth-controlled worker hierarchies, SSE live events. Updated README, STABILITY.md, and CI/release workflows for Node.js dashboard build. Homebrew formula updated.
+
+## 2026-03-17 — /release v0.12.0
+
+- **Commit**: `32d0ca0`
+- **Outcome**: Released v0.12.0 (darwin-arm64, linux-amd64, linux-arm64). Fixed transcript discovery for paths with underscores. Added haiku model option. Upgraded Node.js to 24 LTS in CI. Homebrew formula updated.
