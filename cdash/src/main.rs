@@ -234,7 +234,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     // Sidebar (12 cols) + transcript.
     let main = Layout::horizontal([
-        Constraint::Length(12),
+        Constraint::Length(8),
         Constraint::Min(0),
     ]).split(outer[1]);
 
