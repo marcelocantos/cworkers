@@ -1,8 +1,8 @@
 cworkers
 cworkers-c
 cwork
-cdash
 *.o
+cdash/target/
 .DS_Store
 dashboard/node_modules/
 dashboard/dist/
