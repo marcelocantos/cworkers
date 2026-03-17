@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! cdash — TUI dashboard for cworkers.
-//! Watches activity.jsonl and displays live worker status.
+//! Sidebar of worker IDs, main panel shows selected worker's transcript.
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     DefaultTerminal, Frame,
 };
 use serde::Deserialize;
@@ -38,12 +38,20 @@ struct ActivityEvent {
     model: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct DetailEvent {
+    #[allow(dead_code)]
+    ts: String,
+    event: String,
+    #[serde(default)]
+    data: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct Worker {
     id: String,
     model: String,
     status: Status,
-    started_at: String,
     last_seen: Instant,
 }
 
@@ -56,15 +64,6 @@ enum Status {
 }
 
 impl Status {
-    fn label(&self) -> &str {
-        match self {
-            Status::Active => "active",
-            Status::Done => "done",
-            Status::Error => "error",
-            Status::Stale => "stale",
-        }
-    }
-
     fn color(&self) -> Color {
         match self {
             Status::Active => Color::Green,
@@ -73,13 +72,17 @@ impl Status {
             Status::Stale => Color::Yellow,
         }
     }
+
+    fn is_alive(&self) -> bool {
+        matches!(self, Status::Active | Status::Stale)
+    }
 }
 
 // --- Log reading ---
 
-fn activity_path() -> PathBuf {
+fn data_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".local/share/cworkers/activity.jsonl")
+    PathBuf::from(home).join(".local/share/cworkers")
 }
 
 fn read_activity(path: &PathBuf, offset: &mut u64, workers: &mut BTreeMap<String, Worker>) {
@@ -89,25 +92,17 @@ fn read_activity(path: &PathBuf, offset: &mut u64, workers: &mut BTreeMap<String
 
     for line in reader.lines() {
         let Ok(line) = line else { break };
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(ev) = serde_json::from_str::<ActivityEvent>(&line) else {
-            continue;
-        };
+        if line.is_empty() { continue; }
+        let Ok(ev) = serde_json::from_str::<ActivityEvent>(&line) else { continue; };
 
         match ev.event.as_str() {
             "start" => {
-                workers.insert(
-                    ev.id.clone(),
-                    Worker {
-                        id: ev.id,
-                        model: ev.model.unwrap_or_else(|| "sonnet".into()),
-                        status: Status::Active,
-                        started_at: ev.ts,
-                        last_seen: Instant::now(),
-                    },
-                );
+                workers.insert(ev.id.clone(), Worker {
+                    id: ev.id,
+                    model: ev.model.unwrap_or_else(|| "sonnet".into()),
+                    status: Status::Active,
+                    last_seen: Instant::now(),
+                });
             }
             "done" => {
                 if let Some(w) = workers.get_mut(&ev.id) {
@@ -142,27 +137,46 @@ fn mark_stale(workers: &mut BTreeMap<String, Worker>) {
     }
 }
 
+fn read_worker_log(id: &str) -> Vec<DetailEvent> {
+    let path = data_dir().join("workers").join(format!("{}.jsonl", id));
+    let Ok(file) = File::open(path) else { return vec![] };
+    BufReader::new(file)
+        .lines()
+        .filter_map(|l| l.ok())
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(&l).ok())
+        .collect()
+}
+
 // --- App state ---
 
 struct App {
     workers: BTreeMap<String, Worker>,
-    table_state: TableState,
+    list_state: ListState,
     offset: u64,
     path: PathBuf,
+    show_all: bool,
+    transcript_scroll: u16,
 }
 
 impl App {
     fn new() -> Self {
-        let path = activity_path();
+        let path = data_dir().join("activity.jsonl");
         let mut workers = BTreeMap::new();
         let mut offset = 0u64;
         read_activity(&path, &mut offset, &mut workers);
-        Self {
+        let mut app = Self {
             workers,
-            table_state: TableState::default(),
+            list_state: ListState::default(),
             offset,
             path,
+            show_all: false,
+            transcript_scroll: 0,
+        };
+        if !app.visible_ids().is_empty() {
+            app.list_state.select(Some(0));
         }
+        app
     }
 
     fn refresh(&mut self) {
@@ -170,21 +184,29 @@ impl App {
         mark_stale(&mut self.workers);
     }
 
-    fn sorted_workers(&self) -> Vec<Worker> {
-        let mut ws: Vec<Worker> = self.workers.values().cloned().collect();
+    fn visible_ids(&self) -> Vec<String> {
+        let mut ws: Vec<&Worker> = if self.show_all {
+            self.workers.values().collect()
+        } else {
+            self.workers.values().filter(|w| w.status.is_alive()).collect()
+        };
+        // Active/stale first, then by ID descending.
         ws.sort_by(|a, b| {
-            let ord = match (&a.status, &b.status) {
-                (Status::Active | Status::Stale, Status::Done | Status::Error) => {
-                    std::cmp::Ordering::Less
-                }
-                (Status::Done | Status::Error, Status::Active | Status::Stale) => {
-                    std::cmp::Ordering::Greater
-                }
-                _ => std::cmp::Ordering::Equal,
+            let ord = if a.status.is_alive() == b.status.is_alive() {
+                std::cmp::Ordering::Equal
+            } else if a.status.is_alive() {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
             };
             ord.then_with(|| b.id.cmp(&a.id))
         });
-        ws
+        ws.into_iter().map(|w| w.id.clone()).collect()
+    }
+
+    fn selected_id(&self) -> Option<String> {
+        let ids = self.visible_ids();
+        self.list_state.selected().and_then(|i| ids.get(i).cloned())
     }
 }
 
@@ -192,65 +214,110 @@ impl App {
 
 fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let chunks =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
-            .split(area);
 
-    let active = app
-        .workers
-        .values()
-        .filter(|w| w.status == Status::Active)
-        .count();
+    // Top bar + main area + bottom bar.
+    let outer = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ]).split(area);
+
+    // Header.
+    let active = app.workers.values().filter(|w| w.status == Status::Active).count();
     let total = app.workers.len();
+    let mode = if app.show_all { "all" } else { "active" };
     let header = Line::from(vec![
-        Span::styled(
-            " cdash ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!("| {} active / {} total", active, total)),
+        Span::styled(" cdash ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(format!("| {} active / {} total [{}]", active, total, mode)),
     ]);
-    frame.render_widget(Paragraph::new(header), chunks[0]);
+    frame.render_widget(Paragraph::new(header), outer[0]);
 
-    let workers = app.sorted_workers();
-    let header_row = Row::new(vec!["ID", "Model", "Status", "Started"])
-        .style(Style::default().add_modifier(Modifier::BOLD).fg(Color::DarkGray));
+    // Sidebar (12 cols) + transcript.
+    let main = Layout::horizontal([
+        Constraint::Length(12),
+        Constraint::Min(0),
+    ]).split(outer[1]);
 
-    let rows: Vec<Row> = workers
-        .iter()
-        .map(|w| {
-            let status_style = Style::default().fg(w.status.color());
-            Row::new(vec![
-                Cell::from(w.id.clone()),
-                Cell::from(w.model.clone()),
-                Cell::from(w.status.label().to_string()).style(status_style),
-                Cell::from(w.started_at.clone()),
-            ])
-        })
-        .collect();
+    // Sidebar: worker ID list.
+    let ids = app.visible_ids();
+    let items: Vec<ListItem> = ids.iter().map(|id| {
+        let style = if let Some(w) = app.workers.get(id) {
+            Style::default().fg(w.status.color())
+        } else {
+            Style::default()
+        };
+        ListItem::new(Span::styled(id.as_str(), style))
+    }).collect();
 
-    let widths = [
-        Constraint::Length(10),
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Min(24),
-    ];
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::RIGHT))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
-    let table = Table::new(rows, widths)
-        .header(header_row)
-        .block(Block::default().borders(Borders::NONE))
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(list, main[0], &mut app.list_state);
 
-    frame.render_stateful_widget(table, chunks[1], &mut app.table_state);
+    // Transcript panel.
+    if let Some(selected) = app.selected_id() {
+        let events = read_worker_log(&selected);
+        let mut lines: Vec<Line> = Vec::new();
 
+        for ev in &events {
+            let (label, color) = match ev.event.as_str() {
+                "task" => ("TASK", Color::Cyan),
+                "progress" => ("    ", Color::Yellow),
+                "tool_use" => ("TOOL", Color::Blue),
+                "result" => ("DONE", Color::Green),
+                "error" => ("ERR ", Color::Red),
+                _ => ("    ", Color::DarkGray),
+            };
+            if let Some(data) = &ev.data {
+                // Wrap long lines by splitting manually.
+                let prefix = format!("{} ", label);
+                let first_line = format!("{}{}", prefix, data);
+                for (i, chunk) in first_line.as_bytes().chunks(main[1].width as usize).enumerate() {
+                    let text = String::from_utf8_lossy(chunk);
+                    if i == 0 {
+                        lines.push(Line::from(vec![
+                            Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                            Span::raw(" "),
+                            Span::raw(data.clone()),
+                        ]));
+                    } else {
+                        lines.push(Line::from(Span::raw(format!("     {}", text))));
+                    }
+                }
+            } else {
+                lines.push(Line::from(Span::styled(label, Style::default().fg(color))));
+            }
+        }
+
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled("(no events)", Style::default().fg(Color::DarkGray))));
+        }
+
+        let para = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.transcript_scroll, 0));
+        frame.render_widget(para, main[1]);
+    } else {
+        let empty = Paragraph::new(Span::styled(
+            " select a worker",
+            Style::default().fg(Color::DarkGray),
+        ));
+        frame.render_widget(empty, main[1]);
+    }
+
+    // Footer.
     let footer = Line::from(vec![
         Span::styled(" q", Style::default().fg(Color::Yellow)),
         Span::raw(" quit  "),
         Span::styled("↑↓", Style::default().fg(Color::Yellow)),
-        Span::raw(" navigate"),
+        Span::raw(" select  "),
+        Span::styled("tab", Style::default().fg(Color::Yellow)),
+        Span::raw(" active/all  "),
+        Span::styled("pgup/pgdn", Style::default().fg(Color::Yellow)),
+        Span::raw(" scroll"),
     ]);
-    frame.render_widget(Paragraph::new(footer), chunks[2]);
+    frame.render_widget(Paragraph::new(footer), outer[2]);
 }
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App, rx: mpsc::Receiver<()>) -> io::Result<()> {
@@ -263,16 +330,32 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, rx: mpsc::Receiver<()>) ->
 
         if event::poll(Duration::from_secs(1))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
+                if key.kind != KeyEventKind::Press { continue; }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Up | KeyCode::Char('k') => {
-                        app.table_state.select_previous();
+                        app.list_state.select_previous();
+                        app.transcript_scroll = 0;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        app.table_state.select_next();
+                        app.list_state.select_next();
+                        app.transcript_scroll = 0;
+                    }
+                    KeyCode::Tab => {
+                        app.show_all = !app.show_all;
+                        let ids = app.visible_ids();
+                        if ids.is_empty() {
+                            app.list_state.select(None);
+                        } else {
+                            app.list_state.select(Some(0));
+                        }
+                        app.transcript_scroll = 0;
+                    }
+                    KeyCode::PageDown => {
+                        app.transcript_scroll = app.transcript_scroll.saturating_add(10);
+                    }
+                    KeyCode::PageUp => {
+                        app.transcript_scroll = app.transcript_scroll.saturating_sub(10);
                     }
                     _ => {}
                 }
@@ -285,7 +368,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, rx: mpsc::Receiver<()>) ->
 
 fn main() -> io::Result<()> {
     let (tx, rx) = mpsc::channel();
-    let path = activity_path();
+    let dir = data_dir();
 
     let mut watcher = recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
         if let Ok(ev) = res {
@@ -293,12 +376,9 @@ fn main() -> io::Result<()> {
                 let _ = tx.send(());
             }
         }
-    })
-    .expect("file watcher");
+    }).expect("file watcher");
 
-    if let Some(parent) = path.parent() {
-        let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
-    }
+    let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
 
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;

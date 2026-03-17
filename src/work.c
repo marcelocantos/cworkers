@@ -289,18 +289,22 @@ static void handle_cwork(const char *raw_id, size_t id_len,
     zcopyn(id_copy, sizeof(id_copy), raw_id, id_len);
     if (id_copy_len >= sizeof(id_copy)) id_copy_len = sizeof(id_copy) - 1;
 
-    // Generate globally unique worker ID: w<8 random base36 chars>.
-    char display_name[12]; // w + 8 chars + \0
+    // Generate globally unique worker ID: <model_prefix><6 random base36 chars>.
+    // Model prefix: O=opus, S=sonnet, H=haiku.
+    char display_name[10]; // prefix + 6 chars + \0
     {
         static const char b36[] = "0123456789abcdefghijklmnopqrstuvwxyz";
-        unsigned char rnd[8];
+        unsigned char rnd[6];
         int ufd = open("/dev/urandom", O_RDONLY);
         if (ufd >= 0) { read(ufd, rnd, sizeof(rnd)); close(ufd); }
         else memset(rnd, 0, sizeof(rnd));
-        display_name[0] = 'w';
-        for (int i = 0; i < 8; i++)
+        char prefix = 'S';
+        if (model_len >= 4 && memcmp(model_z, "opus", 4) == 0) prefix = 'O';
+        else if (model_len >= 5 && memcmp(model_z, "haiku", 5) == 0) prefix = 'H';
+        display_name[0] = prefix;
+        for (int i = 0; i < 6; i++)
             display_name[1 + i] = b36[rnd[i] % 36];
-        display_name[9] = '\0';
+        display_name[7] = '\0';
     }
 
     // Open per-worker log.
