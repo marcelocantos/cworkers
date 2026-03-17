@@ -1,21 +1,23 @@
 // Copyright 2026 Marcelo Cantos
 // SPDX-License-Identifier: Apache-2.0
 
-// Append-only NDJSON event log. No SQLite, no indexes.
-// Concurrent writers safe via O_APPEND.
+// Append-only NDJSON event logging.
+// Two files: activity log (lifecycle) and per-worker detail log.
 
 #ifndef CWORKERS_LOG_H
 #define CWORKERS_LOG_H
 
 #include <stddef.h>
 
-#define LOG_PATH_SUFFIX "/.local/share/cworkers/events.jsonl"
+#define LOG_DIR_SUFFIX "/.local/share/cworkers"
 
-// Open (or create) the log file. Returns fd, or -1 on failure.
-int log_open(void);
+// Open the activity log (activity.jsonl). Returns fd, or -1.
+int log_activity_open(void);
 
-// Append a pre-formatted NDJSON line (must not contain newlines).
-// Adds trailing newline. Thread-safe via O_APPEND.
+// Open a per-worker detail log (workers/<id>.jsonl). Returns fd, or -1.
+int log_worker_open(const char *worker_id);
+
+// Append a pre-formatted NDJSON line + newline. Atomic via O_APPEND + writev.
 void log_write(int fd, const char *line, size_t len);
 
 #endif

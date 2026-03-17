@@ -92,14 +92,23 @@ if command -v claude >/dev/null 2>&1; then
         | timeout 60 $CWORK 2>/dev/null)
     check "dispatch: has result" '"id":10' "$out"
     check "dispatch: not error" '"content":[{"type":"text"' "$out"
-    # Check log file was written.
-    logfile="$HOME/.local/share/cworkers/events.jsonl"
-    if [ -f "$logfile" ]; then
-        check "dispatch: log exists" "start" "$(cat "$logfile")"
-        check "dispatch: log done" "done" "$(cat "$logfile")"
+    # Check log files were written.
+    actlog="$HOME/.local/share/cworkers/activity.jsonl"
+    if [ -f "$actlog" ]; then
+        check "dispatch: activity start" "start" "$(cat "$actlog")"
+        check "dispatch: activity done" "done" "$(cat "$actlog")"
     else
         FAIL=$((FAIL + 1))
-        echo "FAIL: dispatch: log file not created at $logfile"
+        echo "FAIL: dispatch: activity log not created at $actlog"
+    fi
+    # Check per-worker log.
+    wlog="$HOME/.local/share/cworkers/workers/w1.jsonl"
+    if [ -f "$wlog" ]; then
+        check "dispatch: worker task" "task" "$(cat "$wlog")"
+        check "dispatch: worker result" "result" "$(cat "$wlog")"
+    else
+        FAIL=$((FAIL + 1))
+        echo "FAIL: dispatch: worker log not created at $wlog"
     fi
 else
     echo "SKIP: dispatch tests (claude not on PATH)"

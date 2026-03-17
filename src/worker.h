@@ -17,6 +17,7 @@ enum worker_event {
     WE_RESULT,    // final result text
     WE_ERROR,     // error result
     WE_LINE,      // raw NDJSON line (for event logging)
+    WE_HEARTBEAT, // periodic liveness signal (no data)
 };
 
 // Callback: called for each event during worker execution.

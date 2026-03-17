@@ -6,11 +6,14 @@
 #include "worker.h"
 #include "json.h"
 
+#include <pthread.h>
 #include <spawn.h>
 #include <string.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#define HEARTBEAT_INTERVAL_SEC 10
 
 extern char **environ;
 
@@ -32,6 +35,24 @@ static char **build_env(const char **env_extra) {
     }
     envp_buf[idx] = NULL;
     return envp_buf;
+}
+
+// --- Heartbeat thread ---
+
+typedef struct {
+    worker_event_fn event_fn;
+    void *ctx;
+    volatile int stop;
+} heartbeat_ctx_t;
+
+static void *heartbeat_thread(void *arg) {
+    heartbeat_ctx_t *hb = arg;
+    while (!hb->stop) {
+        sleep(HEARTBEAT_INTERVAL_SEC);
+        if (hb->stop) break;
+        hb->event_fn(WE_HEARTBEAT, NULL, 0, hb->ctx);
+    }
+    return NULL;
 }
 
 // --- NDJSON line parser ---
@@ -203,6 +224,11 @@ int worker_run(const char *claude_path,
         close(pipe_in[1]);
     }
 
+    // Start heartbeat thread.
+    heartbeat_ctx_t hb = { .event_fn = event_fn, .ctx = ctx, .stop = 0 };
+    pthread_t hb_thread;
+    pthread_create(&hb_thread, NULL, heartbeat_thread, &hb);
+
     // Read NDJSON with 4KB buffer, process line by line.
     char rbuf[4096];
     char linebuf[65536];
@@ -230,6 +256,10 @@ int worker_run(const char *claude_path,
     }
 
     close(pipe_out[0]);
+
+    // Stop heartbeat thread.
+    hb.stop = 1;
+    pthread_join(hb_thread, NULL);
 
     int status;
     waitpid(pid, &status, 0);
