@@ -170,7 +170,7 @@ impl App {
             list_state: ListState::default(),
             offset,
             path,
-            show_all: false,
+            show_all: true,
             transcript_scroll: 0,
         };
         if !app.visible_ids().is_empty() {
@@ -323,11 +323,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App, rx: mpsc::Receiver<()>) -> io::Result<()> {
     loop {
+        app.refresh();
         terminal.draw(|frame| draw(frame, app))?;
-
-        while rx.try_recv().is_ok() {
-            app.refresh();
-        }
 
         if event::poll(Duration::from_secs(1))? {
             if let Event::Key(key) = event::read()? {
@@ -342,7 +339,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, rx: mpsc::Receiver<()>) ->
                         app.list_state.select_next();
                         app.transcript_scroll = 0;
                     }
-                    KeyCode::Tab => {
+                    KeyCode::Char('a') => {
                         app.show_all = !app.show_all;
                         let ids = app.visible_ids();
                         if ids.is_empty() {
