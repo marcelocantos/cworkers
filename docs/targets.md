@@ -1,69 +1,77 @@
 # Targets
 
-<!-- last-evaluated: 44be630 -->
+<!-- last-evaluated: 6da0836 -->
 
 ## Active
 
-### 🎯T6 cworkers operates as an MCP server
-- **Weight**: 5 (value 8 / cost 2)
-- **Estimated-cost**: 2
+### 🎯T8 cworkers is rewritten in C
+- **Weight**: 5 (value 8 / cost 8)
+- **Estimated-cost**: 8
 - **Acceptance**:
-  - Broker runs as an MCP server (streamable HTTP on configurable port, default 4242)
-  - Single MCP tool `cwork(task, cwd, model?)` dispatches tasks to pre-spawned `claude -p` workers
-  - Shadow auto-registers on first `cwork` call per cwd (no explicit shadow/unshadow commands)
-  - Transcript auto-discovery from cwd → `~/.claude/projects/<encoded>/` → most recent .jsonl
-  - Progress heartbeats sent every 20s during dispatch to prevent MCP client timeout
-  - Pre-warming: each dispatch spawns a replacement worker before returning
-  - `help-agent.md` documents MCP usage (embedded via `go:embed`, delivered via `WithInstructions`)
-  - First-use hint appended to first `cwork` result per cwd suggesting CLAUDE.md directive
-  - `agents-guide.md` updated for MCP setup (`.mcp.json` configuration)
-  - `DESIGN.md` updated to reflect MCP architecture
-  - Tests pass
-- **Context**: Major architecture rewrite from CLI-based Unix socket protocol (6 subcommands) to MCP server (2 subcommands: serve, status). The CLI dispatch/worker/shadow/unshadow commands are replaced by a single `cwork` MCP tool. Code compiles and tests pass. Remaining work: documentation updates (DESIGN.md, agents-guide.md) and release.
-- **Status**: converging — code done, docs need update
-- **Discovered**: 2026-03-11
+  - Single C binary replaces Go binary for all subcommands (serve, work, status)
+  - Binary size under 1MB (static, no runtime dependencies)
+  - Instant startup for `work` command (stdio MCP frontend, spawned per session)
+  - Vendored dependencies: cJSON (MIT), SQLite3 amalgamation (public domain), HTTP server library (MIT/permissive)
+  - All current functionality preserved: dispatch API, dashboard, SSE, SQLite observability
+  - Cross-compilation without CGO headaches
+  - Environment variable passthrough from `work` to daemon to `claude -p` workers (corporate proxy/TLS support)
+  - Unix domain socket for daemon communication (replaces TCP port 4242)
+- **Context**: Go + CGO (for SQLite) produces ~15MB binaries and has cross-compilation friction. The `work` command is spawned per Claude Code session — it needs to be lightweight. C gives ~100KB static binary, instant startup, zero runtime. The current Go codebase is ~1200 lines after simplification; C equivalent estimated at 2000-3000 lines. Vendor cJSON, SQLite amalgamation (with aggressive `#define` stripping — disable FTS, JSON1, RTree, window functions, etc.), and a lightweight HTTP server (civetweb or similar).
+- **Status**: identified
+- **Discovered**: 2026-03-17
+
+### 🎯T9 Worker env vars propagate through dispatch chain
+- **Weight**: 4 (value 8 / cost 3)
+- **Estimated-cost**: 3
+- **Acceptance**:
+  - `cworkers work` captures relevant env vars from its environment (pattern-matched: `ANTHROPIC_*`, `CLAUDE_*`, `AWS_*`, `*_PROXY`, `*_proxy`, `NODE_EXTRA_CA_CERTS`)
+  - Captured vars are sent to daemon via the dispatch request
+  - Daemon applies them to spawned `claude -p` worker processes
+  - Config file `~/.config/cworkers/config.json` supports `env` map for daemon-side defaults
+  - CLI-passed vars override config vars
+- **Context**: Corporate environments require `NODE_EXTRA_CA_CERTS`, proxy vars, and custom API endpoints to be available to workers. The brew service daemon doesn't inherit the user's shell environment. The stdio `work` command has the right env (inherited from Claude Code) and can propagate it to the daemon, which applies it to workers.
+- **Status**: identified
+- **Discovered**: 2026-03-17
+
+### 🎯T7 Worker sessions are identified by nonce, not heuristics
+- **Weight**: 4 (value 7 / cost 3)
+- **Estimated-cost**: 3
+- **Acceptance**:
+  - Broker assigns identity at activation time, not spawn time
+  - Worker display names and parent-child relationships managed by broker state
+  - No identity baked into `claude -p` process arguments
+  - Concurrent sessions in the same CWD are correctly distinguished
+- **Context**: Currently workers carry identity via URL params in `--mcp-config`. This prevents generic pre-warming and creates incorrect hierarchical naming. Identity should be a broker-side concept assigned at dispatch time. With the move to stdio MCP + dispatch API, workers no longer connect back via MCP — the broker holds stdin/stdout directly.
+- **Status**: identified
+- **Discovered**: 2026-03-13
 
 ### 🎯T4 cworkers binary detects stale ~/.claude instructions
 - **Weight**: 3 (value 5 / cost 2)
 - **Estimated-cost**: 2
 - **Acceptance**:
   - `cworkers --help-agent` output includes a version or content fingerprint
-  - When the installed guide file (`~/.claude/cworkers-guide.md` or similar) exists but doesn't match the current binary's output, the binary emits a warning with remediation instructions
-  - Detection works without requiring the user to run a special command (e.g., triggered during `cworkers status` or `cworkers worker`)
-- **Context**: After `brew upgrade cworkers`, the operational guide baked into `~/.claude/cworkers-guide.md` may be stale. Users (and their agents) continue following outdated instructions until they manually regenerate. This is a friction point in the upgrade flow. **Note**: The MCP rewrite (🎯T6) changes the delivery mechanism — the guide is now embedded via `WithInstructions` at MCP init, so the file-based staleness check may be less relevant. Consider reframing after 🎯T6 is complete.
+  - When the installed guide is stale relative to the binary, a warning is emitted with remediation
+  - Detection is passive (triggered during normal operation, not a special command)
+- **Context**: After `brew upgrade`, the operational guide delivered via `WithInstructions` auto-updates, but agents-guide.md references may be stale. Less critical since the MCP rewrite delivers the operational guide automatically.
 - **Status**: identified
 - **Discovered**: 2026-03-11
 
 ## Achieved
 
+### 🎯T6 cworkers operates as an MCP server
+- **Status**: achieved — v0.15.0 released. Stateless MCP-to-CLI bridge with stdio and HTTP modes, SQLite observability, Svelte dashboard.
+- **Discovered**: 2026-03-11
+
 ### 🎯T5 Session setup is a single command with auto-discovery
-- **Status**: achieved — superseded by MCP rewrite (🎯T6). Shadow auto-registers implicitly on first `cwork` call per cwd, eliminating all explicit session setup. The original CLI auto-discovery (commit `44be630`) was intermediate; the MCP approach achieves the goal more completely with zero setup commands.
+- **Status**: achieved — superseded by MCP rewrite (🎯T6).
 - **Discovered**: 2026-03-11
 
 ### 🎯T3 v0.9.0 released with self-warming pool
-- **Status**: achieved — v0.9.0 released, Homebrew updated, audit logged
+- **Status**: achieved
 - **Discovered**: 2026-03-11
 
 ### 🎯T1 cworkers is published as open-source on GitHub
 - **Status**: achieved
 
-#### 🎯T1.1 GitHub repo created and code pushed
-- **Status**: achieved — https://github.com/marcelocantos/cworkers
-
-#### 🎯T1.2 v0.1.0 released
-- **Status**: achieved — https://github.com/marcelocantos/cworkers/releases/tag/v0.1.0
-
-#### 🎯T1.3 Audit log entry written
-- **Status**: achieved
-
 ### 🎯T2 Workers are session-scoped
 - **Status**: achieved — released as v0.7.0
-
-#### 🎯T2.1 main.go compiles with session-scoped workers
-- **Status**: achieved
-
-#### 🎯T2.2 All tests pass with session-scoped workers
-- **Status**: achieved
-
-#### 🎯T2.3 Docs updated for session-scoped workers
-- **Status**: achieved

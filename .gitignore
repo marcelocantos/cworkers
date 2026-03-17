@@ -1,4 +1,8 @@
 cworkers
+cworkers-c
+cwork
+cdash
+*.o
 .DS_Store
 dashboard/node_modules/
 dashboard/dist/
