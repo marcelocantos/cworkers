@@ -11,7 +11,6 @@
   let isConnected = $derived(session && !session.disconnected_at);
   let cwd = $derived(store.sessionCWD(sessionID));
   let displayPath = $derived(cwd ? shortenPath(cwd) : null);
-  let transcriptID = $derived(session?.transcript ? session.transcript.slice(0, 8) : null);
   let countText = $derived(
     counts.total === 0
       ? ''
@@ -36,9 +35,6 @@
     <span class="session-path" title={cwd}>{displayPath}</span>
   {:else}
     <span class="session-idle">idle</span>
-  {/if}
-  {#if transcriptID}
-    <span class="transcript-id" title={session.transcript}>{transcriptID}</span>
   {/if}
   {#if countText}
     <span class="session-counts">{countText}</span>
@@ -101,15 +97,6 @@
     font-style: italic;
     font-size: 12px;
     flex: 1;
-  }
-  .transcript-id {
-    color: var(--fg-dim);
-    font-size: 10px;
-    padding: 1px 4px;
-    border-radius: 3px;
-    background: var(--bg2);
-    border: 1px solid var(--border);
-    flex-shrink: 0;
   }
   .session-counts {
     color: var(--fg-dim);

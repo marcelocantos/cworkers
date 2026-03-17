@@ -277,7 +277,6 @@ class WorkerState {
         const s = this.sessions[msg.session.id];
         if (s) {
           if (msg.session.cwd) s.cwd = msg.session.cwd;
-          if (msg.session.transcript) s.transcript = msg.session.transcript;
         }
         break;
       }
