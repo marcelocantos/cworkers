@@ -307,21 +307,17 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Footer.
-    let (active_style, all_style) = if app.show_all {
-        (Style::default().fg(Color::DarkGray), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
-    } else {
-        (Style::default().fg(Color::White).add_modifier(Modifier::BOLD), Style::default().fg(Color::DarkGray))
-    };
+    let hl = Style::default().fg(Color::Yellow);
     let footer = Line::from(vec![
-        Span::styled(" q", Style::default().fg(Color::Yellow)),
+        Span::styled(" q", hl),
         Span::raw(" quit  "),
-        Span::styled("↑↓", Style::default().fg(Color::Yellow)),
+        Span::styled("↑↓", hl),
         Span::raw(" select  "),
-        Span::styled("a", Style::default().fg(Color::Yellow)),
+        Span::styled("a", hl),
         Span::raw(" "),
-        Span::styled("active", active_style),
+        if app.show_all { Span::raw("active") } else { Span::styled("active", hl) },
         Span::raw("/"),
-        Span::styled("all", all_style),
+        if app.show_all { Span::styled("all", hl) } else { Span::raw("all") },
         Span::raw("  "),
         Span::styled("pgup/pgdn", Style::default().fg(Color::Yellow)),
         Span::raw(" scroll"),
