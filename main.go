@@ -102,7 +102,7 @@ func printUsage(w io.Writer) {
 commands:
   serve      Start the MCP broker daemon
                --port <N>    HTTP port (default: %d)
-  status     Show pool and shadow state
+  status     Show pool state
 
 global flags:
   --port <N>     HTTP port (default: %d)
@@ -110,200 +110,6 @@ global flags:
   --help         Show this help
   --help-agent   Show help plus agent integration guide
 `, defaultPort, defaultPort)
-}
-
-// --- Transcript shadow ---
-
-type transcriptEntry struct {
-	Type    string          `json:"type"`
-	Message json.RawMessage `json:"message,omitempty"`
-}
-
-type messageEnvelope struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
-}
-
-// shadow tails a JSONL transcript and maintains a rolling window of
-// recent user/assistant messages as formatted text.
-type shadow struct {
-	mu       sync.RWMutex
-	messages []string
-	maxLines int
-	done     chan struct{}
-	cwd      string
-	first    sync.Once
-}
-
-func newShadow(cwd string, maxLines int) *shadow {
-	if maxLines <= 0 {
-		maxLines = 50
-	}
-	return &shadow{
-		maxLines: maxLines,
-		done:     make(chan struct{}),
-		cwd:      cwd,
-	}
-}
-
-func (s *shadow) add(msg string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.messages = append(s.messages, msg)
-	if len(s.messages) > s.maxLines {
-		s.messages = s.messages[len(s.messages)-s.maxLines:]
-	}
-}
-
-func (s *shadow) snapshot() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if len(s.messages) == 0 {
-		return ""
-	}
-	return strings.Join(s.messages, "\n\n")
-}
-
-func (s *shadow) stop() {
-	select {
-	case <-s.done:
-	default:
-		close(s.done)
-	}
-}
-
-// --- Shadow Registry ---
-
-type shadowRegistry struct {
-	mu      sync.RWMutex
-	shadows map[string]*shadow // cwd → shadow
-}
-
-func newShadowRegistry() *shadowRegistry {
-	return &shadowRegistry{
-		shadows: make(map[string]*shadow),
-	}
-}
-
-// getOrCreate returns an existing shadow for the cwd, or discovers the
-// transcript and registers a new one. Thread-safe.
-func (r *shadowRegistry) getOrCreate(cwd string) (*shadow, error) {
-	r.mu.RLock()
-	s, ok := r.shadows[cwd]
-	r.mu.RUnlock()
-	if ok {
-		return s, nil
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	// Double-check after acquiring write lock.
-	if s, ok := r.shadows[cwd]; ok {
-		return s, nil
-	}
-
-	transcript, err := discoverTranscript(cwd)
-	if err != nil {
-		return nil, err
-	}
-
-	s = newShadow(cwd, 50)
-	r.shadows[cwd] = s
-	go tailTranscript(transcript, s)
-	log.Printf("shadow registered cwd=%s transcript=%s", cwd, filepath.Base(transcript))
-	return s, nil
-}
-
-func (r *shadowRegistry) count() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return len(r.shadows)
-}
-
-func extractText(raw json.RawMessage) string {
-	var str string
-	if json.Unmarshal(raw, &str) == nil {
-		return str
-	}
-
-	var blocks []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if json.Unmarshal(raw, &blocks) == nil {
-		var parts []string
-		for _, b := range blocks {
-			if b.Type == "text" && b.Text != "" {
-				parts = append(parts, b.Text)
-			}
-		}
-		return strings.Join(parts, "\n")
-	}
-
-	return ""
-}
-
-// tailTranscript reads a JSONL file and tails it for new lines.
-func tailTranscript(path string, s *shadow) {
-	f, err := os.Open(path)
-	if err != nil {
-		log.Printf("shadow: open %s: %v", path, err)
-		return
-	}
-	defer f.Close()
-
-	log.Printf("shadowing %s", path)
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
-
-	for {
-		for scanner.Scan() {
-			processLine(scanner.Bytes(), s)
-		}
-		if err := scanner.Err(); err != nil {
-			log.Printf("shadow: scan: %v", err)
-			return
-		}
-		select {
-		case <-s.done:
-			return
-		case <-time.After(500 * time.Millisecond):
-		}
-		scanner = bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
-	}
-}
-
-func processLine(line []byte, s *shadow) {
-	var entry transcriptEntry
-	if json.Unmarshal(line, &entry) != nil {
-		return
-	}
-	if entry.Type != "user" && entry.Type != "assistant" {
-		return
-	}
-	if entry.Message == nil {
-		return
-	}
-
-	var env messageEnvelope
-	if json.Unmarshal(entry.Message, &env) != nil {
-		return
-	}
-
-	text := extractText(env.Content)
-	if text == "" || env.Role == "" {
-		return
-	}
-
-	const maxMsgLen = 2000
-	if len(text) > maxMsgLen {
-		text = text[:maxMsgLen] + "..."
-	}
-
-	role := strings.ToUpper(env.Role[:1]) + env.Role[1:]
-	s.add(fmt.Sprintf("[%s]: %s", role, text))
 }
 
 // --- Progress Throttle ---
@@ -377,6 +183,10 @@ const maxDepth = 3
 
 // claudePath is the resolved path to the claude binary. Set at startup.
 var claudePath = "claude"
+
+// configDBPath overrides the default database path if set via config file.
+var configDBPath string
+
 
 // spawnFunc is the function used to create workers. Replaced in tests.
 var spawnFunc = spawnWorker
@@ -579,135 +389,6 @@ func (w *workerProc) kill() {
 	}
 }
 
-// --- Pool ---
-
-type pool struct {
-	mu         sync.Mutex
-	idle       map[string][]*workerProc // key: cwd + "\x00" + model
-	maxIdlePer int
-}
-
-func newPool(maxIdlePerKey int) *pool {
-	if maxIdlePerKey <= 0 {
-		maxIdlePerKey = 1
-	}
-	return &pool{
-		idle:       make(map[string][]*workerProc),
-		maxIdlePer: maxIdlePerKey,
-	}
-}
-
-func poolKey(cwd, model string, depth int) string {
-	return fmt.Sprintf("%s\x00%s\x00%d", cwd, model, depth)
-}
-
-func (p *pool) take(cwd, model string, depth int) *workerProc {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	key := poolKey(cwd, model, depth)
-	workers := p.idle[key]
-	if len(workers) == 0 {
-		return nil
-	}
-	w := workers[len(workers)-1]
-	p.idle[key] = workers[:len(workers)-1]
-	if len(p.idle[key]) == 0 {
-		delete(p.idle, key)
-	}
-	return w
-}
-
-func (p *pool) put(w *workerProc) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	key := poolKey(w.cwd, w.model, w.depth)
-	if len(p.idle[key]) >= p.maxIdlePer {
-		w.kill()
-		log.Printf("pool: discarded excess %s worker for %s (cap %d)", w.model, w.cwd, p.maxIdlePer)
-		return
-	}
-	p.idle[key] = append(p.idle[key], w)
-}
-
-func (p *pool) count() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	n := 0
-	for _, ws := range p.idle {
-		n += len(ws)
-	}
-	return n
-}
-
-func (p *pool) counts() map[string]int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	m := make(map[string]int)
-	for _, ws := range p.idle {
-		for _, w := range ws {
-			model := w.model
-			if model == "" {
-				model = "default"
-			}
-			m[model]++
-		}
-	}
-	return m
-}
-
-func (p *pool) drain() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for key, ws := range p.idle {
-		for _, w := range ws {
-			w.kill()
-		}
-		delete(p.idle, key)
-	}
-}
-
-// --- Transcript Discovery ---
-
-// discoverTranscript finds the most recently modified .jsonl file in
-// the Claude Code project directory for the given working directory.
-func discoverTranscript(cwd string) (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("home dir: %w", err)
-	}
-
-	// Claude Code encodes the cwd by replacing "/", ".", and "_" with "-" and prepending "-".
-	encoded := "-" + strings.NewReplacer("/", "-", ".", "-", "_", "-").Replace(cwd[1:])
-	projectDir := filepath.Join(home, ".claude", "projects", encoded)
-
-	entries, err := os.ReadDir(projectDir)
-	if err != nil {
-		return "", fmt.Errorf("read project dir %s: %w", projectDir, err)
-	}
-
-	var newest string
-	var newestTime time.Time
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		if info.ModTime().After(newestTime) {
-			newestTime = info.ModTime()
-			newest = e.Name()
-		}
-	}
-
-	if newest == "" {
-		return "", fmt.Errorf("no .jsonl transcripts found in %s", projectDir)
-	}
-
-	return filepath.Join(projectDir, newest), nil
-}
-
 // --- Depth context ---
 
 type contextKey string
@@ -834,7 +515,6 @@ type sessionRow struct {
 	ClientName     string  `json:"client_name"`
 	ClientVersion  string  `json:"client_version"`
 	CWD            string  `json:"cwd"`
-	Transcript     string  `json:"transcript"`
 	Depth          int     `json:"depth"`
 	ConnectedAt    string  `json:"connected_at"`
 	DisconnectedAt *string `json:"disconnected_at,omitempty"`
@@ -950,13 +630,11 @@ func (h *eventHub) sendWorkerEvent(workerID string, data []byte) {
 // --- MCP Broker ---
 
 type broker struct {
-	pool         *pool
-	reg          *shadowRegistry
-	port         int
-	db           *sql.DB
-	mu           sync.Mutex
-	active       map[*workerProc]struct{}
-	nextID       atomic.Int64
+	port     int
+	db       *sql.DB
+	mu       sync.Mutex
+	active   map[*workerProc]struct{}
+	nextID   atomic.Int64
 	eventHub *eventHub
 }
 
@@ -983,20 +661,12 @@ func (b *broker) registerSession(sessionID, clientName, clientVersion string, de
 }
 
 func (b *broker) updateSessionCWD(sessionID, cwd string) {
-	// Best-effort transcript discovery from CWD.
-	var transcript string
-	if tp, err := discoverTranscript(cwd); err == nil {
-		// Store just the base filename (which is the Claude Code session ID).
-		transcript = strings.TrimSuffix(filepath.Base(tp), ".jsonl")
-		log.Printf("session %s: transcript=%s", sessionID, transcript)
-	}
-
-	_, err := b.db.Exec(`UPDATE sessions SET cwd = ?, transcript = ? WHERE id = ?`, cwd, transcript, sessionID)
+	_, err := b.db.Exec(`UPDATE sessions SET cwd = ? WHERE id = ?`, cwd, sessionID)
 	if err != nil {
 		log.Printf("db: update session cwd: %v", err)
 		return
 	}
-	row := sessionRow{ID: sessionID, CWD: cwd, Transcript: transcript}
+	row := sessionRow{ID: sessionID, CWD: cwd}
 	b.eventHub.broadcastLifecycle(sseMsg{Event: "session_update", Session: &row}.encode())
 }
 
@@ -1081,7 +751,6 @@ func (b *broker) untrackWorker(w *workerProc) {
 }
 
 func (b *broker) shutdown() {
-	b.pool.drain()
 	b.mu.Lock()
 	for w := range b.active {
 		w.kill()
@@ -1139,48 +808,21 @@ func (b *broker) handleCwork(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	}
 	b.registerWorker(id, sessionID, parentWID, displayName, cwd, model, taskSummary)
 
-	// Get or auto-register shadow for this cwd.
-	s, err := b.reg.getOrCreate(cwd)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("shadow setup: %v", err)), nil
-	}
-
-	// Build prompt with shadow context and delegation guidance.
+	// Build prompt with delegation guidance.
 	var promptParts []string
 	if guidance := delegationGuidance(depth); guidance != "" {
 		promptParts = append(promptParts, guidance)
 	}
-	if shadowCtx := s.snapshot(); shadowCtx != "" {
-		promptParts = append(promptParts,
-			fmt.Sprintf("=== CONVERSATION CONTEXT (recent messages from root session) ===\n%s\n=== END CONTEXT ===", shadowCtx),
-		)
-	}
 	promptParts = append(promptParts, fmt.Sprintf("TASK: %s", task))
 	prompt := strings.Join(promptParts, "\n\n")
 
-	// Try to get an idle worker.
-	w := b.pool.take(s.cwd, model, depth)
-	if w == nil {
-		log.Printf("[%s] no idle %s worker, spawning cold", displayName, model)
-		var err error
-		w, err = spawnFunc(s.cwd, model, b.port, depth, displayName)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("spawn worker: %v", err)), nil
-		}
-	} else {
-		log.Printf("[%s] dispatching to idle %s worker (pool: %d)", displayName, model, b.pool.count())
+	// Spawn a worker for this task.
+	log.Printf("[%s] spawning %s worker", displayName, model)
+	w, err := spawnFunc(cwd, model, b.port, depth, displayName)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("spawn worker: %v", err)), nil
 	}
 
-	// Pre-warm a replacement in the background.
-	go func() {
-		rw, err := spawnFunc(s.cwd, model, b.port, depth, displayName)
-		if err != nil {
-			log.Printf("[%s] pre-warm failed: %v", displayName, err)
-			return
-		}
-		b.pool.put(rw)
-		log.Printf("[%s] pre-warmed %s worker (pool: %d)", displayName, model, b.pool.count())
-	}()
 
 	// Set up content-driven progress notifications.
 	progressToken := req.Params.Meta.ProgressToken
@@ -1329,48 +971,21 @@ finished:
 	}
 	b.finishWorker(id, "done")
 
-	// On first use for this cwd, append a setup suggestion.
-	var setupHint string
-	s.first.Do(func() {
-		setupHint = `
-
----
-SETUP NOTE: For best results, ensure CLAUDE.md (global or project)
-contains a cworkers directive near the top. If it doesn't have one,
-suggest adding this to the user:
-
-` + "```" + `
-## cworkers
-
-**MANDATORY**: Never run builds (make, go build, npm run, etc.), tests,
-file reads, or searches directly in the root session. Always delegate
-via the ` + "`cwork`" + ` MCP tool. The only exceptions are trivial git commands
-(git status, git diff) whose output you already know will be small.
-When in doubt, delegate.
-
-Workers start instantly (pre-warmed pool). Parallelise aggressively —
-if tasks are independent, fire them as concurrent cwork calls rather
-than sequencing. Don't batch unrelated work into one worker when
-separate parallel workers would be faster.
-` + "```"
-	})
-
-	return mcp.NewToolResultText(result.text + setupHint), nil
+	return mcp.NewToolResultText(result.text), nil
 }
 
 // --- HTTP Status ---
 
 type statusResponse struct {
-	Workers int            `json:"workers"`
-	Models  map[string]int `json:"models"`
-	Shadows int            `json:"shadows"`
+	ActiveWorkers int `json:"active_workers"`
 }
 
 func (b *broker) handleStatus(w http.ResponseWriter, _ *http.Request) {
+	b.mu.Lock()
+	n := len(b.active)
+	b.mu.Unlock()
 	resp := statusResponse{
-		Workers: b.pool.count(),
-		Models:  b.pool.counts(),
-		Shadows: b.reg.count(),
+		ActiveWorkers: n,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -1384,7 +999,7 @@ func (b *broker) handleDashboard(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (b *broker) handleAPISessions(w http.ResponseWriter, _ *http.Request) {
-	rows, err := b.db.Query(`SELECT id, client_name, client_version, cwd, transcript, depth, connected_at, disconnected_at FROM sessions ORDER BY connected_at`)
+	rows, err := b.db.Query(`SELECT id, client_name, client_version, cwd, depth, connected_at, disconnected_at FROM sessions ORDER BY connected_at`)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("db query: %v", err), http.StatusInternalServerError)
 		return
@@ -1394,7 +1009,7 @@ func (b *broker) handleAPISessions(w http.ResponseWriter, _ *http.Request) {
 	list := make([]sessionRow, 0)
 	for rows.Next() {
 		var r sessionRow
-		if err := rows.Scan(&r.ID, &r.ClientName, &r.ClientVersion, &r.CWD, &r.Transcript, &r.Depth, &r.ConnectedAt, &r.DisconnectedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.ClientName, &r.ClientVersion, &r.CWD, &r.Depth, &r.ConnectedAt, &r.DisconnectedAt); err != nil {
 			http.Error(w, fmt.Sprintf("db scan: %v", err), http.StatusInternalServerError)
 			return
 		}
@@ -1530,6 +1145,7 @@ func loadConfig(homeDir string) {
 	}
 	var cfg struct {
 		ClaudePath string `json:"claude_path"`
+		DBPath     string `json:"db_path"`
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		log.Printf("warning: invalid config.json: %v", err)
@@ -1538,6 +1154,10 @@ func loadConfig(homeDir string) {
 	if cfg.ClaudePath != "" {
 		claudePath = cfg.ClaudePath
 		log.Printf("claude path: %s (from config)", claudePath)
+	}
+	if cfg.DBPath != "" {
+		configDBPath = cfg.DBPath
+		log.Printf("db path: %s (from config)", configDBPath)
 	}
 }
 
@@ -1549,7 +1169,10 @@ func serve(port int) {
 
 	loadConfig(homeDir)
 
-	dbPath := filepath.Join(homeDir, ".local", "share", "cworkers", "cworkers.db")
+	dbPath := configDBPath
+	if dbPath == "" {
+		dbPath = filepath.Join(homeDir, ".local", "share", "cworkers", "cworkers.db")
+	}
 	db, err := initDB(dbPath)
 	if err != nil {
 		log.Fatalf("init db: %v", err)
@@ -1557,8 +1180,6 @@ func serve(port int) {
 	defer db.Close()
 
 	b := &broker{
-		pool:     newPool(1),
-		reg:      newShadowRegistry(),
 		port:     port,
 		db:       db,
 		active:   make(map[*workerProc]struct{}),
@@ -1690,20 +1311,7 @@ func statusCmd(port int) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("WORKERS: %d", s.Workers)
-	if len(s.Models) > 0 {
-		fmt.Printf(" (")
-		first := true
-		for m, c := range s.Models {
-			if !first {
-				fmt.Printf(", ")
-			}
-			fmt.Printf("%s: %d", m, c)
-			first = false
-		}
-		fmt.Printf(")")
-	}
-	fmt.Printf(", shadows: %d\n", s.Shadows)
+	fmt.Printf("ACTIVE WORKERS: %d\n", s.ActiveWorkers)
 }
 
 // --- Utility ---

@@ -2,14 +2,29 @@
 
 cworkers is a task broker that delegates work to worker agents. Workers are
 pre-spawned `claude -p` processes managed by the broker — dispatched tasks
-start instantly with no startup overhead. Shadow mode gives workers automatic
-awareness of your conversation context.
+start instantly with no startup overhead.
 
 ## Usage
 
 Call `cwork` to delegate a task. Pass your working directory and the task
-description. The broker automatically discovers your transcript and injects
-recent conversation context into the worker's prompt.
+description. Workers start with a clean context — they have access to the
+project's CLAUDE.md and tools, but no awareness of your conversation. Write
+task descriptions that include all the context the worker needs.
+
+## Writing Good Task Descriptions
+
+Workers start fresh. They don't know what you've been discussing, what files
+you've read, or what decisions you've made. Include:
+
+- **What to do** — the specific action or question
+- **Why** — enough background that the worker can make good judgement calls
+- **Where** — file paths, function names, relevant code locations
+- **What to return** — the format and level of detail you need back
+
+Bad: "fix the build error"
+Good: "Run `make` in /path/to/project and fix any compilation errors. The
+recent change was adding a `db_path` field to the config struct in main.go.
+Report what was wrong and what you changed."
 
 ## When to Delegate
 
@@ -74,7 +89,5 @@ result of an earlier one.
   context, so tell the worker what format you need — a one-line summary, a
   list of failures, specific values. Don't ask for raw logs or full file
   contents unless you actually need them.
-- Workers see your recent conversation context via shadow mode. You don't need
-  to repeat background information in the task — just describe what to do.
 - Each `cwork` call is synchronous: it blocks until the worker completes and
   returns the result. Use multiple parallel calls to avoid idle waiting.
