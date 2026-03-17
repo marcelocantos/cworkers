@@ -33,8 +33,6 @@ static char line_buf[LINE_CAP];
 static char log_storage[LOG_CAP];
 static jbuf_t logbuf;
 
-// Worker ID counter.
-static int worker_seq = 0;
 
 // --- Read line from stdin ---
 
@@ -290,15 +288,16 @@ static void handle_cwork(const char *raw_id, size_t id_len,
     zcopyn(id_copy, sizeof(id_copy), raw_id, id_len);
     if (id_copy_len >= sizeof(id_copy)) id_copy_len = sizeof(id_copy) - 1;
 
-    // Generate worker display name.
-    worker_seq++;
-    char display_name[16];
+    // Generate globally unique worker ID: w<epoch_us> (microseconds).
+    char display_name[32];
     {
-        char tmp[16];
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        unsigned long long us = (unsigned long long)ts.tv_sec * 1000000
+                              + (unsigned long long)ts.tv_nsec / 1000;
+        char tmp[24];
         int i = (int)sizeof(tmp);
-        int v = worker_seq;
-        if (v == 0) tmp[--i] = '0';
-        else while (v > 0) { tmp[--i] = (char)('0' + v % 10); v /= 10; }
+        while (us > 0) { tmp[--i] = (char)('0' + us % 10); us /= 10; }
         tmp[--i] = 'w';
         int dlen = (int)sizeof(tmp) - i;
         memcpy(display_name, tmp + i, (size_t)dlen);
