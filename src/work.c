@@ -6,6 +6,7 @@
 // detail to per-worker files. 35KB binary, zero SQLite.
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/uio.h>
@@ -24,19 +25,25 @@ extern const unsigned long long help_agent_size;
 #define CWORKERS_VERSION "dev"
 #endif
 
-// Output buffer for JSON-RPC responses.
-#define OUT_CAP (64 * 1024)
-static char out_storage[OUT_CAP];
-static jbuf_t out;
-
-// Line read buffer for stdin.
+// Line read buffer for stdin (main thread only).
 #define LINE_CAP (256 * 1024)
 static char line_buf[LINE_CAP];
 
-// Scratch buffer for log entries.
+// Mutex protecting stdout writes (shared by all dispatch threads).
+static pthread_mutex_t stdout_mu = PTHREAD_MUTEX_INITIALIZER;
+
+// Active dispatch thread tracking.
+static pthread_mutex_t threads_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t threads_cond = PTHREAD_COND_INITIALIZER;
+static int active_threads = 0;
+
+// Per-thread buffer sizes.
+#define OUT_CAP (64 * 1024)
 #define LOG_CAP (64 * 1024)
-static char log_storage[LOG_CAP];
-static jbuf_t logbuf;
+
+// Main thread output buffer (for initialize, tools/list, errors).
+static char main_out_storage[OUT_CAP];
+static jbuf_t main_out;
 
 
 // --- Read line from stdin ---
@@ -55,45 +62,48 @@ static ssize_t read_line(void) {
     }
 }
 
-// --- Emit helpers (JSON-RPC to stdout) ---
+// --- Emit helpers (JSON-RPC to stdout, mutex-protected) ---
 
-static void emit_flush(void) {
-    jb_flush_line(&out);
+// Flush buffer to stdout under mutex, then reset.
+static void emit_flush(jbuf_t *b) {
+    pthread_mutex_lock(&stdout_mu);
+    jb_flush_line(b);
+    pthread_mutex_unlock(&stdout_mu);
 }
 
-static void emit_response_head(const char *raw_id, size_t id_len) {
-    jb_reset(&out);
-    jb_lit(&out, "{\"jsonrpc\":\"2.0\",\"id\":");
-    jb_raw(&out, raw_id, id_len);
-    jb_ch(&out, ',');
+static void emit_response_head(jbuf_t *b, const char *raw_id, size_t id_len) {
+    jb_reset(b);
+    jb_lit(b, "{\"jsonrpc\":\"2.0\",\"id\":");
+    jb_raw(b, raw_id, id_len);
+    jb_ch(b, ',');
 }
 
 // raw=1: text is pre-escaped JSON string content. raw=0: plain C string.
-static void emit_tool_result(const char *raw_id, size_t id_len,
+static void emit_tool_result(jbuf_t *b, const char *raw_id, size_t id_len,
                              const char *text, size_t text_len,
                              int is_error, int raw) {
-    emit_response_head(raw_id, id_len);
-    jb_lit(&out, "\"result\":{");
-    if (is_error) jb_lit(&out, "\"isError\":true,");
-    jb_lit(&out, "\"content\":[{\"type\":\"text\",\"text\":");
-    if (raw) jb_raw_str(&out, text, text_len);
-    else     jb_strn(&out, text, text_len);
-    jb_lit(&out, "}]}}");
-    emit_flush();
+    emit_response_head(b, raw_id, id_len);
+    jb_lit(b, "\"result\":{");
+    if (is_error) jb_lit(b, "\"isError\":true,");
+    jb_lit(b, "\"content\":[{\"type\":\"text\",\"text\":");
+    if (raw) jb_raw_str(b, text, text_len);
+    else     jb_strn(b, text, text_len);
+    jb_lit(b, "}]}}");
+    emit_flush(b);
 }
 
-static void emit_tool_error(const char *raw_id, size_t id_len,
+static void emit_tool_error(jbuf_t *b, const char *raw_id, size_t id_len,
                             const char *msg) {
-    emit_tool_result(raw_id, id_len, msg, strlen(msg), 1, 0);
+    emit_tool_result(b, raw_id, id_len, msg, strlen(msg), 1, 0);
 }
 
-static void emit_progress(const char *msg, size_t msg_len) {
-    jb_reset(&out);
-    jb_lit(&out, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\","
-                  "\"params\":{\"level\":\"info\",\"data\":");
-    jb_strn(&out, msg, msg_len);
-    jb_lit(&out, "}}");
-    emit_flush();
+static void emit_progress(jbuf_t *b, const char *msg, size_t msg_len) {
+    jb_reset(b);
+    jb_lit(b, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\","
+               "\"params\":{\"level\":\"info\",\"data\":");
+    jb_strn(b, msg, msg_len);
+    jb_lit(b, "}}");
+    emit_flush(b);
 }
 
 // --- Timestamp ---
@@ -121,40 +131,41 @@ static void emit_timestamp(jbuf_t *b) {
 // --- Log helpers ---
 
 // Write to activity.jsonl (lifecycle events).
-static void log_activity(int afd, const char *worker_id, const char *event,
+static void log_activity(jbuf_t *lb, int afd, const char *worker_id,
+                         const char *event,
                          const char *extra_key, const char *extra_val) {
-    jb_reset(&logbuf);
-    jb_ch(&logbuf, '{');
-    jb_key(&logbuf, "ts"); emit_timestamp(&logbuf);
-    jb_ch(&logbuf, ',');
-    jb_key(&logbuf, "id"); jb_str(&logbuf, worker_id);
-    jb_ch(&logbuf, ',');
-    jb_key(&logbuf, "event"); jb_str(&logbuf, event);
+    jb_reset(lb);
+    jb_ch(lb, '{');
+    jb_key(lb, "ts"); emit_timestamp(lb);
+    jb_ch(lb, ',');
+    jb_key(lb, "id"); jb_str(lb, worker_id);
+    jb_ch(lb, ',');
+    jb_key(lb, "event"); jb_str(lb, event);
     if (extra_key && extra_val) {
-        jb_ch(&logbuf, ',');
-        jb_key(&logbuf, extra_key); jb_str(&logbuf, extra_val);
+        jb_ch(lb, ',');
+        jb_key(lb, extra_key); jb_str(lb, extra_val);
     }
-    jb_ch(&logbuf, '}');
-    log_write(afd, logbuf.data, logbuf.len);
+    jb_ch(lb, '}');
+    log_write(afd, lb->data, lb->len);
 }
 
 // Write to per-worker file (detail events).
 // raw=1: data is already JSON-escaped (from json_str). raw=0: plain string.
-static void log_detail(int wfd, const char *event,
+static void log_detail(jbuf_t *lb, int wfd, const char *event,
                        const char *data, size_t data_len, int raw) {
-    jb_reset(&logbuf);
-    jb_ch(&logbuf, '{');
-    jb_key(&logbuf, "ts"); emit_timestamp(&logbuf);
-    jb_ch(&logbuf, ',');
-    jb_key(&logbuf, "event"); jb_str(&logbuf, event);
+    jb_reset(lb);
+    jb_ch(lb, '{');
+    jb_key(lb, "ts"); emit_timestamp(lb);
+    jb_ch(lb, ',');
+    jb_key(lb, "event"); jb_str(lb, event);
     if (data && data_len > 0) {
-        jb_ch(&logbuf, ',');
-        jb_key(&logbuf, "data");
-        if (raw) jb_raw_str(&logbuf, data, data_len);
-        else     jb_strn(&logbuf, data, data_len);
+        jb_ch(lb, ',');
+        jb_key(lb, "data");
+        if (raw) jb_raw_str(lb, data, data_len);
+        else     jb_strn(lb, data, data_len);
     }
-    jb_ch(&logbuf, '}');
-    log_write(wfd, logbuf.data, logbuf.len);
+    jb_ch(lb, '}');
+    log_write(wfd, lb->data, lb->len);
 }
 
 // --- Env var passthrough ---
@@ -197,6 +208,8 @@ typedef struct {
     int activity_fd;
     int worker_fd;
     int got_result;
+    jbuf_t *out;    // per-thread output buffer
+    jbuf_t *logbuf; // per-thread log buffer
 } dispatch_ctx_t;
 
 static void on_worker_event(enum worker_event ev,
@@ -207,8 +220,8 @@ static void on_worker_event(enum worker_event ev,
     case WE_TEXT:
         if (len > 0 && (data[0] == '#' ||
                        (len > 1 && data[0] == '*' && data[1] == '*'))) {
-            emit_progress(data, len);
-            log_detail(ctx->worker_fd, "progress", data, len, 1);
+            emit_progress(ctx->out, data, len);
+            log_detail(ctx->logbuf, ctx->worker_fd, "progress", data, len, 1);
         }
         break;
     case WE_TOOL_USE: {
@@ -217,32 +230,117 @@ static void on_worker_event(enum worker_event ev,
         size_t copy = len < sizeof(msg) - mlen - 1 ? len : sizeof(msg) - mlen - 1;
         memcpy(msg + mlen, data, copy);
         mlen += copy;
-        emit_progress(msg, mlen);
-        log_detail(ctx->worker_fd, "tool_use", data, len, 1);
+        emit_progress(ctx->out, msg, mlen);
+        log_detail(ctx->logbuf, ctx->worker_fd, "tool_use", data, len, 1);
         break;
     }
     case WE_RESULT:
-        emit_tool_result(ctx->raw_id, ctx->id_len, data, len, 0, 1);
-        log_detail(ctx->worker_fd, "result", data, len, 1);
-        log_activity(ctx->activity_fd, ctx->worker_id, "done", NULL, NULL);
+        emit_tool_result(ctx->out, ctx->raw_id, ctx->id_len, data, len, 0, 1);
+        log_detail(ctx->logbuf, ctx->worker_fd, "result", data, len, 1);
+        log_activity(ctx->logbuf, ctx->activity_fd, ctx->worker_id, "done", NULL, NULL);
         ctx->got_result = 1;
         break;
     case WE_ERROR:
-        emit_tool_result(ctx->raw_id, ctx->id_len, data, len, 1, 1);
-        log_detail(ctx->worker_fd, "error", data, len, 1);
-        log_activity(ctx->activity_fd, ctx->worker_id, "error", NULL, NULL);
+        emit_tool_result(ctx->out, ctx->raw_id, ctx->id_len, data, len, 1, 1);
+        log_detail(ctx->logbuf, ctx->worker_fd, "error", data, len, 1);
+        log_activity(ctx->logbuf, ctx->activity_fd, ctx->worker_id, "error", NULL, NULL);
         ctx->got_result = 1;
         break;
     case WE_LINE:
         break;
     case WE_HEARTBEAT:
-        log_activity(ctx->activity_fd, ctx->worker_id, "heartbeat", NULL, NULL);
+        log_activity(ctx->logbuf, ctx->activity_fd, ctx->worker_id, "heartbeat", NULL, NULL);
         break;
     }
 }
 
-// --- Handle tools/call ---
+// --- Handle tools/call (runs in its own thread) ---
 
+// Thread argument: all data copied from line_buf before thread starts.
+typedef struct {
+    char id_copy[64];
+    size_t id_len;
+    char cwd[1024];
+    char model[64];
+    size_t task_len;
+    int activity_fd;
+    char task[];  // flexible array member — must be last
+} cwork_args_t;
+
+static void *cwork_thread(void *arg) {
+    cwork_args_t *a = arg;
+
+    // Per-thread buffers (on stack — 128KB total, well within default 8MB stack).
+    char out_storage[OUT_CAP];
+    char log_storage[LOG_CAP];
+    jbuf_t out, lb;
+    jb_init(&out, out_storage, OUT_CAP);
+    jb_bind(&out, STDOUT_FILENO);
+    jb_init(&lb, log_storage, LOG_CAP);
+
+    // Generate worker ID.
+    char display_name[10];
+    {
+        static const char b36[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+        unsigned char rnd[6];
+        int ufd = open("/dev/urandom", O_RDONLY);
+        if (ufd >= 0) { read(ufd, rnd, sizeof(rnd)); close(ufd); }
+        else memset(rnd, 0, sizeof(rnd));
+        char prefix = 'S';
+        size_t mlen = strlen(a->model);
+        if (mlen >= 4 && memcmp(a->model, "opus", 4) == 0) prefix = 'O';
+        else if (mlen >= 5 && memcmp(a->model, "haiku", 5) == 0) prefix = 'H';
+        display_name[0] = prefix;
+        for (int i = 0; i < 6; i++)
+            display_name[1 + i] = b36[rnd[i] % 36];
+        display_name[7] = '\0';
+    }
+
+    int worker_fd = log_worker_open(display_name);
+
+    log_detail(&lb, worker_fd, "task", a->task, a->task_len, 1);
+    log_activity(&lb, a->activity_fd, display_name, "start", "model", a->model);
+
+    struct iovec prompt_iov[2] = {
+        { .iov_base = (void *)"TASK: ", .iov_len = 6 },
+        { .iov_base = a->task, .iov_len = a->task_len },
+    };
+
+    const char **env = collect_env();
+
+    dispatch_ctx_t dctx = {
+        .raw_id = a->id_copy,
+        .id_len = a->id_len,
+        .worker_id = display_name,
+        .activity_fd = a->activity_fd,
+        .worker_fd = worker_fd,
+        .got_result = 0,
+        .out = &out,
+        .logbuf = &lb,
+    };
+
+    int rc = worker_run(NULL, a->cwd, a->model, prompt_iov, 2,
+                        env, on_worker_event, &dctx);
+
+    if (rc < 0) {
+        emit_tool_error(&out, a->id_copy, a->id_len, "failed to spawn worker");
+        log_activity(&lb, a->activity_fd, display_name, "error", NULL, NULL);
+    } else if (!dctx.got_result) {
+        emit_tool_error(&out, a->id_copy, a->id_len, "worker exited without result");
+        log_activity(&lb, a->activity_fd, display_name, "error", NULL, NULL);
+    }
+
+    if (worker_fd >= 0) close(worker_fd);
+    free(arg);
+
+    pthread_mutex_lock(&threads_mu);
+    active_threads--;
+    pthread_cond_signal(&threads_cond);
+    pthread_mutex_unlock(&threads_mu);
+    return NULL;
+}
+
+// Parse and validate cwork call, then spawn dispatch thread.
 static void handle_cwork(const char *raw_id, size_t id_len,
                          const char *params, size_t params_len,
                          int activity_fd) {
@@ -252,13 +350,13 @@ static void handle_cwork(const char *raw_id, size_t id_len,
     json_scan(&ps, params, params_len);
 
     if (!json_str_eq(&ps, 0, "cwork")) {
-        emit_response_head(raw_id, id_len);
-        jb_lit(&out, "\"error\":{\"code\":-32601,\"message\":\"unknown tool\"}}");
-        emit_flush();
+        emit_response_head(&main_out, raw_id, id_len);
+        jb_lit(&main_out, "\"error\":{\"code\":-32601,\"message\":\"unknown tool\"}}");
+        emit_flush(&main_out);
         return;
     }
     if (!ps.vals[1]) {
-        emit_tool_error(raw_id, id_len, "missing arguments");
+        emit_tool_error(&main_out, raw_id, id_len, "missing arguments");
         return;
     }
 
@@ -273,11 +371,11 @@ static void handle_cwork(const char *raw_id, size_t id_len,
     const char *model = json_str(&args, 2, &model_len);
 
     if (!task || task_len == 0) {
-        emit_tool_error(raw_id, id_len, "missing required parameter: task");
+        emit_tool_error(&main_out, raw_id, id_len, "missing required parameter: task");
         return;
     }
     if (!cwd || cwd_len == 0) {
-        emit_tool_error(raw_id, id_len, "missing required parameter: cwd");
+        emit_tool_error(&main_out, raw_id, id_len, "missing required parameter: cwd");
         return;
     }
     if (!model || model_len == 0) {
@@ -285,92 +383,51 @@ static void handle_cwork(const char *raw_id, size_t id_len,
         model_len = 6;
     }
 
-    // Copy strings out of line_buf before worker reuses it.
-    char cwd_z[1024], model_z[64], task_z[LINE_CAP];
-    zcopyn(cwd_z, sizeof(cwd_z), cwd, cwd_len);
-    zcopyn(model_z, sizeof(model_z), model, model_len);
-    zcopyn(task_z, sizeof(task_z), task, task_len);
-
-    // Copy raw_id.
-    char id_copy[64];
-    size_t id_copy_len = id_len;
-    zcopyn(id_copy, sizeof(id_copy), raw_id, id_len);
-    if (id_copy_len >= sizeof(id_copy)) id_copy_len = sizeof(id_copy) - 1;
-
-    // Generate globally unique worker ID: <model_prefix><6 random base36 chars>.
-    // Model prefix: O=opus, S=sonnet, H=haiku.
-    char display_name[10]; // prefix + 6 chars + \0
-    {
-        static const char b36[] = "0123456789abcdefghijklmnopqrstuvwxyz";
-        unsigned char rnd[6];
-        int ufd = open("/dev/urandom", O_RDONLY);
-        if (ufd >= 0) { read(ufd, rnd, sizeof(rnd)); close(ufd); }
-        else memset(rnd, 0, sizeof(rnd));
-        char prefix = 'S';
-        if (model_len >= 4 && memcmp(model_z, "opus", 4) == 0) prefix = 'O';
-        else if (model_len >= 5 && memcmp(model_z, "haiku", 5) == 0) prefix = 'H';
-        display_name[0] = prefix;
-        for (int i = 0; i < 6; i++)
-            display_name[1 + i] = b36[rnd[i] % 36];
-        display_name[7] = '\0';
+    // Allocate thread args with task as flexible array member.
+    cwork_args_t *a = malloc(sizeof(cwork_args_t) + task_len + 1);
+    if (!a) {
+        emit_tool_error(&main_out, raw_id, id_len, "out of memory");
+        return;
     }
+    zcopyn(a->id_copy, sizeof(a->id_copy), raw_id, id_len);
+    a->id_len = id_len < sizeof(a->id_copy) - 1 ? id_len : sizeof(a->id_copy) - 1;
+    zcopyn(a->cwd, sizeof(a->cwd), cwd, cwd_len);
+    zcopyn(a->model, sizeof(a->model), model, model_len);
+    memcpy(a->task, task, task_len);
+    a->task[task_len] = '\0';
+    a->task_len = task_len;
+    a->activity_fd = activity_fd;
 
-    // Open per-worker log.
-    int worker_fd = log_worker_open(display_name);
+    pthread_mutex_lock(&threads_mu);
+    active_threads++;
+    pthread_mutex_unlock(&threads_mu);
 
-    // Log start: full task in worker file, summary in activity.
-    log_detail(worker_fd, "task", task_z, task_len, 1);
-    log_activity(activity_fd, display_name, "start", "model", model_z);
-
-    // Build prompt as iovecs.
-    struct iovec prompt_iov[2] = {
-        { .iov_base = (void *)"TASK: ", .iov_len = 6 },
-        { .iov_base = task_z, .iov_len = task_len },
-    };
-
-    const char **env = collect_env();
-
-    dispatch_ctx_t dctx = {
-        .raw_id = id_copy,
-        .id_len = id_copy_len,
-        .worker_id = display_name,
-        .activity_fd = activity_fd,
-        .worker_fd = worker_fd,
-        .got_result = 0,
-    };
-
-    int rc = worker_run(NULL, cwd_z, model_z, prompt_iov, 2,
-                        env, on_worker_event, &dctx);
-
-    if (rc < 0) {
-        emit_tool_error(id_copy, id_copy_len, "failed to spawn worker");
-        log_activity(activity_fd, display_name, "error", NULL, NULL);
-    } else if (!dctx.got_result) {
-        emit_tool_error(id_copy, id_copy_len, "worker exited without result");
-        log_activity(activity_fd, display_name, "error", NULL, NULL);
-    }
-
-    if (worker_fd >= 0) close(worker_fd);
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&tid, &attr, cwork_thread, a);
+    pthread_attr_destroy(&attr);
 }
 
 // --- MCP protocol responses ---
 
-static void emit_initialize(const char *raw_id, size_t id_len) {
-    emit_response_head(raw_id, id_len);
-    jb_lit(&out,
+static void emit_initialize(jbuf_t *b, const char *raw_id, size_t id_len) {
+    emit_response_head(b, raw_id, id_len);
+    jb_lit(b,
         "\"result\":{"
             "\"protocolVersion\":\"2025-03-26\","
             "\"serverInfo\":{\"name\":\"cworkers\",\"version\":\"" CWORKERS_VERSION "\"},"
             "\"capabilities\":{\"tools\":{}},"
             "\"instructions\":");
-    jb_strn(&out, help_agent_data, (size_t)help_agent_size);
-    jb_lit(&out, "}}");
-    emit_flush();
+    jb_strn(b, help_agent_data, (size_t)help_agent_size);
+    jb_lit(b, "}}");
+    emit_flush(b);
 }
 
-static void emit_tools_list(const char *raw_id, size_t id_len) {
-    emit_response_head(raw_id, id_len);
-    jb_lit(&out,
+static void emit_tools_list(jbuf_t *b, const char *raw_id, size_t id_len) {
+    emit_response_head(b, raw_id, id_len);
+    jb_lit(b,
         "\"result\":{\"tools\":[{"
             "\"name\":\"cwork\","
             "\"description\":\"Dispatch a task to a worker agent. Returns the worker's result.\","
@@ -384,15 +441,14 @@ static void emit_tools_list(const char *raw_id, size_t id_len) {
                 "\"required\":[\"task\",\"cwd\"]"
             "}"
         "}]}}");
-    emit_flush();
+    emit_flush(b);
 }
 
 // --- Main loop ---
 
 int work_main(void) {
-    jb_init(&out, out_storage, OUT_CAP);
-    jb_bind(&out, STDOUT_FILENO);
-    jb_init(&logbuf, log_storage, LOG_CAP);
+    jb_init(&main_out, main_out_storage, OUT_CAP);
+    jb_bind(&main_out, STDOUT_FILENO);
 
     int activity_fd = log_activity_open();
 
@@ -413,18 +469,24 @@ int work_main(void) {
         size_t id_len = msg.lens[1];
 
         if (method_len == 10 && memcmp(method, "initialize", 10) == 0) {
-            emit_initialize(raw_id, id_len);
+            emit_initialize(&main_out, raw_id, id_len);
         } else if (method_len == 10 && memcmp(method, "tools/list", 10) == 0) {
-            emit_tools_list(raw_id, id_len);
+            emit_tools_list(&main_out, raw_id, id_len);
         } else if (method_len == 10 && memcmp(method, "tools/call", 10) == 0) {
             if (msg.vals[2])
                 handle_cwork(raw_id, id_len, msg.vals[2], msg.lens[2], activity_fd);
         } else if (raw_id) {
-            emit_response_head(raw_id, id_len);
-            jb_lit(&out, "\"error\":{\"code\":-32601,\"message\":\"method not found\"}}");
-            emit_flush();
+            emit_response_head(&main_out, raw_id, id_len);
+            jb_lit(&main_out, "\"error\":{\"code\":-32601,\"message\":\"method not found\"}}");
+            emit_flush(&main_out);
         }
     }
+
+    // Wait for all dispatch threads to complete before exiting.
+    pthread_mutex_lock(&threads_mu);
+    while (active_threads > 0)
+        pthread_cond_wait(&threads_cond, &threads_mu);
+    pthread_mutex_unlock(&threads_mu);
 
     if (activity_fd >= 0) close(activity_fd);
     return 0;
