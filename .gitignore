@@ -1,8 +1,8 @@
+cwork
 cworkers
 cworkers-c
-cwork
 cdash-bin
 *.o
 .DS_Store
-dashboard/node_modules/
-dashboard/dist/
+dashboard/
+vendor/

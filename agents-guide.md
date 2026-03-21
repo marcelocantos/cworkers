@@ -1,40 +1,27 @@
 # cworkers Setup
 
-Install cworkers and configure Claude Code to use it as an MCP server.
+Install cwork and configure Claude Code to use it.
 
-## 1. Install and start the broker
+## 1. Install
 
 ```bash
-brew install marcelocantos/tap/cworkers
-brew services start marcelocantos/tap/cworkers
+# From source:
+cc -std=c11 -Wall -Wextra -Os -Isrc -o cwork \
+  src/cwork.c src/work.c src/json.c src/log.c src/worker.c \
+  src/help_agent.s -lpthread
+cp cwork ~/.local/bin/
 ```
-
-The broker runs as an MCP server on port 4242 by default.
 
 ## 2. Configure MCP
 
-Add to your project's `.mcp.json` (or `~/.claude.json` for global).
+Add to your `~/.claude.json` (or project `.mcp.json`):
 
-**Stdio mode** (preferred — no network config needed):
 ```json
 {
   "mcpServers": {
     "cworkers": {
       "type": "stdio",
-      "command": "cworkers",
-      "args": ["work"]
-    }
-  }
-}
-```
-
-**HTTP mode** (alternative — connects directly to daemon):
-```json
-{
-  "mcpServers": {
-    "cworkers": {
-      "type": "streamable-http",
-      "url": "http://localhost:4242/mcp"
+      "command": "cwork"
     }
   }
 }
@@ -55,19 +42,9 @@ via the `cwork` MCP tool. The only exceptions are trivial git commands
 When in doubt, delegate.
 ```
 
-## 4. Configure claude path (optional)
-
-If the `claude` binary isn't on `PATH` (e.g., when running as a brew service),
-create `~/.config/cworkers/config.json`:
-
-```json
-{
-  "claude_path": "/Users/you/.local/bin/claude"
-}
-```
-
-## 5. Start using it
+## 4. Start using it
 
 The `cwork` MCP tool is now available. Call it with a `task` and your
-`cwd` (working directory). Workers start fresh — include all necessary context in the task description.
-See `cworkers --help-agent` for the full operational guide.
+`cwd` (working directory). Workers start fresh — include all necessary
+context in the task description. See `cwork --help-agent` for the full
+operational guide.
