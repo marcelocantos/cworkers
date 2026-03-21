@@ -4,33 +4,47 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-cworkers is a task broker for Claude Code agent sessions. It runs as an MCP server that spawns `claude -p` worker processes on demand and returns their output. Stateless MCP-to-CLI bridge with SQLite observability and a Svelte dashboard. Single Go binary.
+cworkers is a task broker for Claude Code agent sessions. Two binaries:
 
-Subcommands: `serve` (MCP daemon on port 4242), `status` (active worker query). See `DESIGN.md` for the full architecture and known limitations.
+- **`cwork`** (C, 53KB) — Stdio MCP server. Spawns `claude -p` workers on demand, returns results. Zero malloc, concurrent dispatch via pthreads. Logs events to NDJSON files.
+- **`cdash`** (Go) — TUI dashboard. Watches activity log, renders worker transcripts with glamour markdown.
+
+No daemon. `cwork` is spawned by Claude Code as a stdio MCP server. Workers run in parallel. The dashboard is optional.
 
 ## Build & Test
 
 ```bash
-make          # build the cworkers binary
-make test     # run all tests (go test ./...)
-make install  # copy binary to /usr/local/bin
-make clean    # remove binary
+# cwork (C binary)
+cc -std=c11 -Wall -Wextra -Werror -Os -Isrc -o cwork \
+  src/cwork.c src/work.c src/json.c src/log.c src/worker.c \
+  src/help_agent.s -lpthread -dead_strip
+sh test/test_cwork.sh
+
+# cdash (Go binary)
+cd cdash && go build -o ../cdash-bin .
 ```
 
-Run a single test:
+Install cwork:
 ```bash
-go test -run TestE2EWorkerReceivesTask ./...
+cp cwork ~/.local/bin/cwork
 ```
 
 ## Architecture
 
-Everything lives in a single `main.go` with `main_test.go` for tests. Key components:
+### cwork (src/)
+- `cwork.c` — entry point, CLI flags
+- `work.c` — MCP JSON-RPC protocol, dispatch logic, NDJSON logging
+- `worker.c` — `posix_spawnp` worker management, NDJSON output parsing, heartbeat thread
+- `json.c/h` — zero-alloc JSON scanner (single-pass key extraction) and emitter
+- `log.c/h` — append-only NDJSON event logging (`O_APPEND` for concurrent writers)
+- `help_agent.s` — linker-level embedding of `help-agent.md` via `.incbin`
 
-- **MCP server** — Streamable HTTP on `/mcp` (via mcp-go library). Single tool: `cwork(task, cwd, model?)`.
-- **workerProc** — A `claude -p` process spawned on demand per `cwork` call. Receives prompt on stdin, produces NDJSON on stdout. Broker parses stream-json output for result text.
-- **SQLite DB** — Logs sessions, workers, and worker output events to `~/.local/share/cworkers/cworkers.db`.
-- **Dashboard** — Svelte 5 single-file HTML served at `/dashboard`; reads live data via HTTP API and SSE.
-- **Progress heartbeats** — Sends `notifications/progress` and `notifications/message` every 20s during dispatch to prevent MCP client timeout.
+### cdash (cdash/)
+- `main.go` — bubbletea TUI, glamour markdown rendering, fsnotify file watcher
+
+### Data files (~/.local/share/cworkers/)
+- `activity.jsonl` — worker lifecycle events (start/done/error/heartbeat)
+- `workers/<id>.jsonl` — per-worker detail logs (task, progress, result)
 
 ## Delivery
 

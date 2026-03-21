@@ -7,35 +7,36 @@ needs to delegate work (research, analysis, code generation), it must either
 do it inline — blocking the conversation — or spawn a sub-agent with
 `--tool-use-id`, which carries ~15-18k tokens of overhead per invocation.
 
-cworkers solves the blocking problem: it is a thin MCP-to-CLI bridge that
-spawns worker agents on demand. Each `cwork` call spawns a fresh `claude -p`
-process, waits for its output, and returns the result. The broker adds SQLite
-observability and a Svelte dashboard; it does not manage worker pools or inject
-conversation context.
+cworkers solves the blocking problem: `cwork` is a 53KB stdio MCP server
+that spawns worker agents on demand. Each `cwork` call spawns a fresh
+`claude -p` process, waits for its output, and returns the result. Workers
+run concurrently via pthreads.
 
 ## Architecture
 
 ```
- Root Agent Session
+ Claude Code session
    |
-   |  MCP tool call: cwork(task, cwd, model?)
+   |  stdio MCP (JSON-RPC)
    |
-   +---> cworkers serve --port 4242     # MCP broker daemon (global, one per user)
-   |       - Streamable HTTP on /mcp
-   |       - Spawns claude -p worker on demand
-   |       - Logs to SQLite for observability
-   |       - Svelte dashboard on /dashboard
-   |       - HTTP status endpoint on /status
+   +---> cwork                        # 53KB C binary
+   |       - Reads JSON-RPC from stdin
+   |       - Spawns claude -p workers via posix_spawnp
+   |       - Concurrent dispatch (pthread per cwork call)
+   |       - Streams progress as MCP notifications
+   |       - Logs to NDJSON files for observability
+   |       - Returns result as MCP tool response
    |
-   |  (on each dispatch)
-   |     -> spawns fresh claude -p worker with task on stdin
-   |     -> sends progress heartbeats every 20s
-   |     -> returns worker's result as MCP tool response
+   |  (optional)
+   |
+   +---> cdash                        # Go TUI dashboard
+           - Watches activity.jsonl via fsnotify
+           - Renders worker transcripts with glamour
 ```
 
-The system is a single Go binary with two subcommands: `serve` (MCP daemon)
-and `status` (active worker query). Workers are `claude -p` processes spawned
-on demand — not pre-warmed or pooled.
+There is no daemon. `cwork` is spawned by Claude Code as a stdio MCP server
+subprocess. It inherits the parent's environment (proxy vars, CA certs, API
+keys) and passes them to workers.
 
 ## MCP Interface
 
@@ -48,84 +49,78 @@ cwork(task: string, cwd: string, model?: string) → string
 - **task**: The prompt to send to the worker. Callers must provide all
   necessary context — workers start fresh with no knowledge of the parent
   conversation.
-- **cwd**: Working directory of the calling session. Sets the worker process
-  working directory.
+- **cwd**: Working directory for the worker process.
 - **model**: Model for the worker (default: "sonnet"). Options: sonnet, opus,
   haiku.
 
-The broker:
-1. Spawns a fresh `claude -p` worker process.
-2. Writes the task to the worker's stdin (prepended with delegation policy
-   when depth ≥ 1).
-3. Sends progress heartbeats every 20s to prevent MCP client timeout.
-4. Returns the worker's result text.
-
-### Status Endpoint
-
-```
-GET /status → { "active_workers": N }
-```
-
-Also available via CLI: `cworkers status [--port N]`.
-
 ## Worker Processes
 
-Workers are `claude -p --verbose --output-format stream-json
---dangerously-skip-permissions` processes. They are spawned on demand by the
-broker for each `cwork` call. There is no pool or pre-warming — each dispatch
-starts a fresh worker from scratch.
-
-Workers start with no knowledge of the parent conversation. Callers must
-include all relevant context in the `task` parameter.
+Workers are `claude -p --verbose --output-format stream-json` processes
+spawned via `posix_spawnp`. Each `cwork` call spawns a fresh worker — there
+is no pool or pre-warming.
 
 ### NDJSON Output Parsing
 
-Workers produce stream-json output. The broker parses NDJSON lines looking
-for:
-- `"type": "assistant"` messages — accumulated as text parts.
-- `"type": "result"` with `"subtype": "success"` — the final result text.
-- `"type": "result"` with errors — reported as tool errors.
+Workers produce stream-json output. `cwork` parses NDJSON lines looking for:
+- `"type": "assistant"` messages — text and tool_use blocks forwarded as
+  progress notifications
+- `"type": "result"` with `"subtype": "success"` — the final result text
+- `"type": "result"` with errors — reported as tool errors
 
-If a `result` line is found, its text is returned. Otherwise, accumulated
-assistant text parts are joined and returned.
+### Heartbeat Thread
 
-## Model Routing
+A pthread sends periodic heartbeat events (every 10s) to the activity log
+while a worker is running. The dashboard uses these to detect crashed workers
+(no heartbeat for >30s = stale).
 
-Workers are spawned with the requested model via `--model`. Default model is
-"sonnet". This enables routing tasks by complexity: opus for deep reasoning,
-sonnet for structured/mechanical work, haiku for monotonous tasks.
+## Observability
 
-## Depth-Controlled Hierarchies
+### Activity Log
 
-Workers receive `cwork` access at `depth+1` via a synthesised `--mcp-config`
-argument. Workers at `maxDepth` (currently 3) are denied `cwork` access
-entirely and receive an error. This prevents runaway recursive delegation.
+`~/.local/share/cworkers/activity.jsonl` — lifecycle events for all workers:
+```json
+{"ts":"...","id":"S6w52nk","event":"start","model":"sonnet"}
+{"ts":"...","id":"S6w52nk","event":"heartbeat"}
+{"ts":"...","id":"S6w52nk","event":"done"}
+```
 
-## Progress Heartbeats
+Safe for concurrent writers (`O_APPEND` + `writev`). Worker IDs are
+`<model_prefix><6 random base36 chars>` (e.g., `S6w52nk` for sonnet,
+`Okraccr` for opus, `Hc0j6r6` for haiku).
 
-Long-running dispatches send `notifications/progress` and
-`notifications/message` every 20 seconds via the MCP server context.
-This prevents MCP client timeouts during extended worker operations.
+### Per-Worker Logs
 
-## SQLite Observability
+`~/.local/share/cworkers/workers/<id>.jsonl` — full detail per worker:
+```json
+{"ts":"...","event":"task","data":"the full task prompt"}
+{"ts":"...","event":"progress","data":"## Reading files"}
+{"ts":"...","event":"tool_use","data":"Read"}
+{"ts":"...","event":"result","data":"the worker's output"}
+```
 
-The broker logs sessions, workers, and worker output events to SQLite at
-`~/.local/share/cworkers/cworkers.db`. The Svelte dashboard at `/dashboard`
-reads this data via HTTP API endpoints. Sessions from previous server runs
-remain in the DB (not wiped on start) but are marked disconnected on startup.
+Only one process writes to each file. Arbitrarily large task descriptions
+are supported.
+
+### Dashboard (cdash)
+
+Go TUI using bubbletea + glamour. Sidebar shows worker IDs (color-coded by
+status), main panel renders the selected worker's transcript as markdown.
+Watches activity.jsonl via fsnotify for live updates.
+
+## Environment Passthrough
+
+`cwork` captures env vars matching `ANTHROPIC_*`, `CLAUDE_*`, `AWS_*`,
+`*_PROXY`, `*_proxy`, and `NODE_EXTRA_CA_CERTS` from its environment and
+passes them to spawned workers. This supports corporate environments with
+custom proxy/TLS/API configurations.
 
 ## Known Limitations
 
-- **No task acknowledgment**: Once the broker writes a prompt to a worker's
-  stdin, it considers the task delivered. If the worker crashes mid-
-  execution, the task is lost — there is no retry or dead-letter mechanism.
+- **No task acknowledgment**: If a worker crashes mid-execution, the task is
+  lost — there is no retry or dead-letter mechanism.
 
 - **No context injection**: Workers start fresh. Callers are responsible for
-  providing all context in the task description. This keeps the broker
-  stateless but places more burden on the caller to write complete task
-  prompts.
+  providing all context in the task description.
 
-- **Port-based, not socket-based**: The MCP server uses HTTP (default port
-  4242). Unlike a Unix socket design, this is accessible from any process on
-  localhost but does not provide per-user isolation. Multiple users on the
-  same host need different ports.
+- **Worker ID collisions**: IDs use 6 random base36 chars from `/dev/urandom`.
+  Collision probability is negligible for normal use (~2B possible IDs).
